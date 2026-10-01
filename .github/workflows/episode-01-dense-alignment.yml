@@ -1,0 +1,131 @@
+name: Episode 1 dense timeline map
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/episode-01-dense-alignment.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FTP_HOST: wood.seedhost.eu
+      FTP_USER: ianseeds
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+
+    steps:
+      - name: Install tools
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install --quiet numpy
+
+      - name: Download episode 1 pair
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib, os
+          files={
+            "dvd.avi":"/downloads/S60/DVD/Studio 60 - 01 - Pilot.avi",
+            "hd.mp4":"/downloads/S60/1080p/Studio 60 S01E01.mp4",
+          }
+          ftp=ftplib.FTP()
+          ftp.connect(os.environ["FTP_HOST"],21,timeout=30)
+          ftp.login(os.environ["FTP_USER"],os.environ["FTP_PASSWORD"])
+          ftp.voidcmd("TYPE I")
+          for local,remote in files.items():
+              with open(local,"wb") as fh:
+                  ftp.retrbinary("RETR "+remote, fh.write, blocksize=1024*1024)
+          ftp.quit()
+          PY
+
+      - name: Extract alignment audio
+        shell: bash
+        run: |
+          ffmpeg -v error -i dvd.avi -map 0:a:0 -ac 1 -ar 1000 -f s16le dvd.pcm
+          ffmpeg -v error -i hd.mp4  -map 0:a:0 -ac 1 -ar 1000 -f s16le hd.pcm
+
+      - name: Build dense offset map
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, numpy as np
+
+          sr=1000
+          env_hz=100
+          block=sr//env_hz
+
+          def env(path):
+              x=np.fromfile(path,dtype="<i2").astype(np.float32)
+              n=(len(x)//block)*block
+              x=x[:n].reshape(-1,block)
+              e=np.sqrt(np.mean(x*x,axis=1))
+              e=np.log1p(e)
+              return (e-np.mean(e))/(np.std(e)+1e-6)
+
+          dvd=env("dvd.pcm")
+          hd=env("hd.pcm")
+
+          half_template=6
+          search_radius=8
+          anchors=list(range(120,2641,60))
+          rows=[]
+
+          for t in anchors:
+              hs=int((t-half_template)*env_hz)
+              he=int((t+half_template)*env_hz)
+              if he>len(hd):
+                  continue
+              template=hd[hs:he]
+              template=(template-template.mean())/(template.std()+1e-6)
+
+              ds=max(0,int((t-half_template-search_radius)*env_hz))
+              de=min(len(dvd),int((t+half_template+search_radius)*env_hz))
+              search=dvd[ds:de]
+              search=(search-search.mean())/(search.std()+1e-6)
+              corr=np.correlate(search,template,mode="valid")
+              best=int(np.argmax(corr))
+              dvd_start=(ds+best)/env_hz
+              offset=dvd_start-(t-half_template)
+              score=float(corr[best]/len(template))
+              rows.append({"anchor":t,"offset":round(offset,3),"score":round(score,4)})
+
+          # Segment into stable plateaus. A new segment starts when adjacent
+          # high-confidence anchors differ by >0.30 s.
+          segments=[]
+          current=[]
+          for row in rows:
+              if not current:
+                  current=[row]
+                  continue
+              if row["score"]>=0.45 and current[-1]["score"]>=0.45 and abs(row["offset"]-current[-1]["offset"])<=0.30:
+                  current.append(row)
+              else:
+                  segments.append(current)
+                  current=[row]
+          if current:
+              segments.append(current)
+
+          summarized=[]
+          for seg in segments:
+              offs=[r["offset"] for r in seg if r["score"]>=0.45]
+              summarized.append({
+                  "anchor_start":seg[0]["anchor"],
+                  "anchor_end":seg[-1]["anchor"],
+                  "count":len(seg),
+                  "median_offset":round(float(np.median(offs)),3) if offs else None,
+                  "min_score":round(min(r["score"] for r in seg),4),
+                  "max_score":round(max(r["score"] for r in seg),4),
+              })
+
+          print("=== DENSE OFFSET MAP JSON ===")
+          print(json.dumps(rows,indent=2))
+          print("=== OFFSET PLATEAUS JSON ===")
+          print(json.dumps(summarized,indent=2))
+          PY

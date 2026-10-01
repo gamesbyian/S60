@@ -1,0 +1,146 @@
+name: Source characterization PyAV
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/source-characterization-pyav.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  characterize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FTP_HOST: wood.seedhost.eu
+      FTP_USER: ianseeds
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+
+    steps:
+      - name: Install Python media dependencies
+        shell: bash
+        run: |
+          python3 -m pip install --quiet av numpy
+
+      - name: Download episode 1 reference pair
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib, os, pathlib
+          host=os.environ["FTP_HOST"]; user=os.environ["FTP_USER"]; password=os.environ["FTP_PASSWORD"]
+          files={
+            "dvd.avi":"/downloads/S60/DVD/Studio 60 - 01 - Pilot.avi",
+            "hd.mp4":"/downloads/S60/1080p/Studio 60 S01E01.mp4",
+          }
+          ftp=ftplib.FTP()
+          ftp.connect(host,21,timeout=30)
+          ftp.login(user,password)
+          ftp.voidcmd("TYPE I")
+          for local,remote in files.items():
+              size=ftp.size(remote)
+              print(f"Downloading {remote} ({size:,} bytes)")
+              with open(local,"wb") as fh:
+                  ftp.retrbinary("RETR "+remote, fh.write, blocksize=1024*1024)
+              print(f"Downloaded {local}: {pathlib.Path(local).stat().st_size:,} bytes")
+          ftp.quit()
+          PY
+
+      - name: Characterize sources
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import av, json, hashlib, numpy as np
+          from fractions import Fraction
+
+          files={"dvd":"dvd.avi","1080p":"hd.mp4"}
+          sample_times=[60,300,600,900,1200,1500,1800,2100]
+          result={}
+
+          def rat(x):
+              if x is None:
+                  return None
+              try:
+                  return f"{x.numerator}/{x.denominator}"
+              except Exception:
+                  return str(x)
+
+          def frame_at(container, stream, seconds):
+              target=int(seconds / float(stream.time_base))
+              container.seek(target, stream=stream, any_frame=False, backward=True)
+              for frame in container.decode(stream):
+                  t=float(frame.pts * frame.time_base) if frame.pts is not None else None
+                  if t is None or t >= seconds:
+                      return frame, t
+              return None, None
+
+          for label,path in files.items():
+              c=av.open(path)
+              v=next(s for s in c.streams if s.type=="video")
+              aud=[s for s in c.streams if s.type=="audio"]
+              meta={
+                  "container_format": c.format.name,
+                  "duration_seconds": float(c.duration/av.time_base) if c.duration is not None else None,
+                  "bit_rate": c.bit_rate,
+                  "video": {
+                      "codec": v.codec_context.name,
+                      "width": v.codec_context.width,
+                      "height": v.codec_context.height,
+                      "pixel_format": v.codec_context.pix_fmt,
+                      "average_rate": rat(v.average_rate),
+                      "base_rate": rat(v.base_rate),
+                      "guessed_rate": rat(v.guessed_rate),
+                      "time_base": rat(v.time_base),
+                      "start_time": v.start_time,
+                      "duration_ts": v.duration,
+                      "duration_seconds": float(v.duration * v.time_base) if v.duration is not None else None,
+                      "frames": v.frames,
+                      "sample_aspect_ratio": rat(v.sample_aspect_ratio),
+                  },
+                  "audio": []
+              }
+              for a in aud:
+                  meta["audio"].append({
+                      "codec": a.codec_context.name,
+                      "sample_rate": a.codec_context.sample_rate,
+                      "channels": a.codec_context.channels,
+                      "layout": a.codec_context.layout.name if a.codec_context.layout else None,
+                      "time_base": rat(a.time_base),
+                      "duration_seconds": float(a.duration * a.time_base) if a.duration is not None else None,
+                  })
+
+              samples=[]
+              for t in sample_times:
+                  frame,actual=frame_at(c,v,t)
+                  if frame is None:
+                      samples.append({"requested_t":t,"error":"no frame"})
+                      continue
+                  tiny=frame.reformat(width=64,height=36,format="gray")
+                  arr=tiny.to_ndarray()
+                  h=hashlib.sha256(arr.tobytes()).hexdigest()
+                  # Coarse active-image bounds at a low luma threshold. This is diagnostic,
+                  # not a production crop decision.
+                  full=frame.reformat(format="gray").to_ndarray()
+                  row=np.mean(full,axis=1)
+                  col=np.mean(full,axis=0)
+                  threshold=8.0
+                  ys=np.where(row>threshold)[0]
+                  xs=np.where(col>threshold)[0]
+                  bounds=None
+                  if len(xs) and len(ys):
+                      bounds={"x0":int(xs[0]),"y0":int(ys[0]),"x1":int(xs[-1]),"y1":int(ys[-1])}
+                  samples.append({
+                      "requested_t":t,
+                      "actual_t":actual,
+                      "sha256_64x36_gray":h,
+                      "mean_luma":float(np.mean(full)),
+                      "active_bounds_threshold8":bounds,
+                  })
+              meta["samples"]=samples
+              result[label]=meta
+              c.close()
+
+          print("=== SOURCE CHARACTERIZATION JSON ===")
+          print(json.dumps(result,indent=2))
+          PY

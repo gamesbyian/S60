@@ -1,0 +1,144 @@
+name: Episode 1 alignment probe
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/episode-01-alignment.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  align:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FTP_HOST: wood.seedhost.eu
+      FTP_USER: ianseeds
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+
+    steps:
+      - name: Install analysis tools
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install --quiet numpy
+
+      - name: Download episode 1 pair
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib, os
+          files={
+            "dvd.avi":"/downloads/S60/DVD/Studio 60 - 01 - Pilot.avi",
+            "hd.mp4":"/downloads/S60/1080p/Studio 60 S01E01.mp4",
+          }
+          ftp=ftplib.FTP()
+          ftp.connect(os.environ["FTP_HOST"],21,timeout=30)
+          ftp.login(os.environ["FTP_USER"],os.environ["FTP_PASSWORD"])
+          ftp.voidcmd("TYPE I")
+          for local,remote in files.items():
+              print("Downloading", remote)
+              with open(local,"wb") as fh:
+                  ftp.retrbinary("RETR "+remote, fh.write, blocksize=1024*1024)
+          ftp.quit()
+          PY
+
+      - name: Extract low-rate mono audio
+        shell: bash
+        run: |
+          ffmpeg -v error -i dvd.avi -map 0:a:0 -ac 1 -ar 1000 -f s16le dvd.pcm
+          ffmpeg -v error -i hd.mp4  -map 0:a:0 -ac 1 -ar 1000 -f s16le hd.pcm
+
+      - name: Estimate local timeline offsets
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, numpy as np
+
+          sr=1000
+          env_hz=100
+          block=sr//env_hz
+
+          def load_env(path):
+              x=np.fromfile(path,dtype="<i2").astype(np.float32)
+              n=(len(x)//block)*block
+              x=x[:n].reshape(-1,block)
+              # short-time energy is robust to phase/polarity differences
+              e=np.sqrt(np.mean(x*x,axis=1))
+              e=np.log1p(e)
+              e=(e-np.mean(e))/(np.std(e)+1e-6)
+              return e
+
+          dvd=load_env("dvd.pcm")
+          hd=load_env("hd.pcm")
+
+          anchors=[300,900,1500,2100,2550]
+          half_template=10
+          search_radius=30
+          out=[]
+
+          for t in anchors:
+              hs=int((t-half_template)*env_hz)
+              he=int((t+half_template)*env_hz)
+              template=hd[hs:he]
+              template=(template-template.mean())/(template.std()+1e-6)
+
+              ds=max(0,int((t-half_template-search_radius)*env_hz))
+              de=min(len(dvd),int((t+half_template+search_radius)*env_hz))
+              search=dvd[ds:de]
+              search=(search-search.mean())/(search.std()+1e-6)
+
+              corr=np.correlate(search,template,mode="valid")
+              best=int(np.argmax(corr))
+              dvd_start=(ds+best)/env_hz
+              hd_start=t-half_template
+              offset=dvd_start-hd_start
+
+              # Normalize by template length for a readable relative score.
+              score=float(corr[best]/len(template))
+              out.append({
+                  "anchor_hd_seconds":t,
+                  "best_dvd_minus_hd_offset_seconds":round(offset,3),
+                  "correlation_score":round(score,5),
+                  "matched_dvd_template_start_seconds":round(dvd_start,3),
+              })
+
+          print("=== LOCAL AUDIO ALIGNMENT JSON ===")
+          print(json.dumps(out,indent=2))
+          PY
+
+      - name: Probe DVD 29.97 cadence
+        shell: bash
+        run: |
+          ffmpeg -v error -ss 300 -i dvd.avi -t 12 -an -vf scale=64:36:flags=area,format=gray -f rawvideo dvd-gray.raw
+          python3 - <<'PY'
+          import json, numpy as np
+          w,h=64,36
+          raw=np.fromfile("dvd-gray.raw",dtype=np.uint8)
+          frames=raw.reshape((-1,h,w)).astype(np.int16)
+          mad=np.mean(np.abs(frames[1:]-frames[:-1]),axis=(1,2))
+          near=float(np.percentile(mad,10))
+          by_mod={}
+          for mod in range(5):
+              vals=mad[np.arange(len(mad))%5==mod]
+              by_mod[str(mod)]={
+                  "mean_mad":round(float(np.mean(vals)),4),
+                  "median_mad":round(float(np.median(vals)),4),
+                  "p10_mad":round(float(np.percentile(vals,10)),4),
+              }
+          lowest=np.argsort(mad)[:30]
+          print("=== DVD CADENCE JSON ===")
+          print(json.dumps({
+              "decoded_frames":int(len(frames)),
+              "adjacent_diff_count":int(len(mad)),
+              "overall_mean_mad":round(float(np.mean(mad)),4),
+              "overall_median_mad":round(float(np.median(mad)),4),
+              "overall_p10_mad":round(near,4),
+              "by_transition_index_mod_5":by_mod,
+              "lowest_30_transition_indices":[int(x) for x in lowest],
+              "lowest_30_mad":[round(float(mad[x]),4) for x in lowest],
+          },indent=2))
+          PY

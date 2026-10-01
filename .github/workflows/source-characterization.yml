@@ -19,6 +19,12 @@ jobs:
       FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
 
     steps:
+      - name: Install FFmpeg
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
       - name: Download episode 1 reference pair
         shell: bash
         run: |

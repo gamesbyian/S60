@@ -32,6 +32,7 @@ jobs:
           ftp=ftplib.FTP()
           ftp.connect(host,21,timeout=30)
           ftp.login(user,password)
+          ftp.voidcmd("TYPE I")
           for local,remote in files.items():
               size=ftp.size(remote)
               print(f"Downloading {remote} ({size:,} bytes)")

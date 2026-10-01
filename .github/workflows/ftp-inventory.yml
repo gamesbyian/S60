@@ -26,6 +26,7 @@ jobs:
           import ftplib
           import os
           import sys
+          from collections import deque
 
           host = os.environ["FTP_HOST"]
           user = os.environ["FTP_USER"]
@@ -43,59 +44,88 @@ jobs:
           print(f"Login directory: {ftp.pwd()}")
           print("")
 
-          def list_here(label):
-              print(f"== {label} ({ftp.pwd()}) ==")
+          def entries_here():
               try:
                   entries = list(ftp.mlsd())
                   entries.sort(key=lambda item: item[0].lower())
-                  for name, facts in entries:
-                      if name in (".", ".."):
-                          continue
-                      kind = facts.get("type", "?")
-                      raw_size = facts.get("size")
-                      size = int(raw_size) if raw_size and raw_size.isdigit() else None
-                      size_text = f"{size:,} bytes" if size is not None else "-"
-                      print(f"{kind:8} {size_text:>18}  {name}")
-                  return [name for name, _ in entries if name not in (".", "..")]
-              except Exception as exc:
-                  print(f"MLSD unavailable: {type(exc).__name__}: {exc}")
+                  return [(name, facts) for name, facts in entries if name not in (".", "..")]
+              except Exception:
                   names = sorted(ftp.nlst(), key=str.lower)
-                  for name in names:
-                      print(name)
-                  return names
-              finally:
-                  print("")
+                  return [(name, {"type": "?"}) for name in names]
+
+          def print_entries(label, entries):
+              print(f"== {label} ({ftp.pwd()}) ==")
+              for name, facts in entries:
+                  kind = facts.get("type", "?")
+                  raw_size = facts.get("size")
+                  size = int(raw_size) if raw_size and str(raw_size).isdigit() else None
+                  size_text = f"{size:,} bytes" if size is not None else "-"
+                  print(f"{kind:8} {size_text:>18}  {name}")
+              print("")
 
           ftp.cwd("/")
-          root_names = list_here("FTP root")
+          root_entries = entries_here()
+          print_entries("FTP root", root_entries)
 
-          candidates = []
-          for name in root_names:
-              lname = name.lower()
-              if any(token in lname for token in ("download", "home", "files", "data", "media", "storage", user.lower())):
-                  candidates.append(name)
+          # We now know /downloads exists. Inventory it directly, then search
+          # a bounded subtree for anything named like S60. This is read-only.
+          try:
+              ftp.cwd("/downloads")
+          except Exception as exc:
+              print(f"ERROR: /downloads exists in the root listing but CWD failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+              sys.exit(3)
 
-          print("Candidate directories to inspect:", ", ".join(candidates) if candidates else "(none found by name)")
-          print("")
+          downloads_entries = entries_here()
+          print_entries("/downloads", downloads_entries)
 
-          for name in candidates[:12]:
+          matches = []
+          queue = deque()
+          for name, facts in downloads_entries:
+              if facts.get("type") == "dir":
+                  queue.append((f"/downloads/{name}", 1))
+
+          max_depth = 3
+          max_dirs = 250
+          visited = 0
+
+          while queue and visited < max_dirs:
+              path, depth = queue.popleft()
+              visited += 1
               try:
-                  ftp.cwd("/")
-                  ftp.cwd(name)
-                  list_here(f"child: /{name}")
-              except Exception as exc:
-                  print(f"Could not inspect /{name}: {type(exc).__name__}: {exc}")
-                  print("")
-
-          # Also try the original expected locations so the log makes the mismatch explicit.
-          for path in ("/downloads", "/downloads/s60", "downloads", "downloads/s60"):
-              try:
-                  ftp.cwd("/")
                   ftp.cwd(path)
-                  print(f"FOUND expected-style path: {path} -> {ftp.pwd()}")
-                  list_here(f"expected-style path: {path}")
+                  entries = entries_here()
               except Exception as exc:
-                  print(f"Not found: {path}: {type(exc).__name__}: {exc}")
+                  print(f"Could not inspect {path}: {type(exc).__name__}: {exc}")
+                  continue
+
+              base = path.rsplit("/", 1)[-1].lower()
+              if "s60" in base:
+                  matches.append(path)
+                  print_entries(f"S60-like directory: {path}", entries)
+
+              if depth < max_depth:
+                  for name, facts in entries:
+                      if facts.get("type") != "dir":
+                          continue
+                      child = f"{path}/{name}"
+                      if "s60" in name.lower():
+                          matches.append(child)
+                          try:
+                              ftp.cwd(child)
+                              print_entries(f"S60-like directory: {child}", entries_here())
+                          except Exception as exc:
+                              print(f"Could not inspect match {child}: {type(exc).__name__}: {exc}")
+                      queue.append((child, depth + 1))
+
+          # De-duplicate while preserving order.
+          matches = list(dict.fromkeys(matches))
+          print(f"Scanned {visited} directories beneath /downloads (max depth {max_depth}).")
+          if matches:
+              print("S60-like paths found:")
+              for path in matches:
+                  print(f"  {path}")
+          else:
+              print("No directory containing 's60' found within the bounded search.")
 
           try:
               ftp.quit()

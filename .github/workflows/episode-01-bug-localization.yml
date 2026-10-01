@@ -1,0 +1,164 @@
+name: Episode 1 network bug localization
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/episode-01-bug-localization.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  localize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      FTP_HOST: wood.seedhost.eu
+      FTP_USER: ianseeds
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+
+    steps:
+      - name: Install tools
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install --quiet numpy opencv-python-headless
+
+      - name: Download episode 1 pair
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib, os
+          files={
+            "dvd.avi":"/downloads/S60/DVD/Studio 60 - 01 - Pilot.avi",
+            "hd.mp4":"/downloads/S60/1080p/Studio 60 S01E01.mp4",
+          }
+          ftp=ftplib.FTP()
+          ftp.connect(os.environ["FTP_HOST"],21,timeout=30)
+          ftp.login(os.environ["FTP_USER"],os.environ["FTP_PASSWORD"])
+          ftp.voidcmd("TYPE I")
+          for local,remote in files.items():
+              with open(local,"wb") as fh:
+                  ftp.retrbinary("RETR "+remote, fh.write, blocksize=1024*1024)
+          ftp.quit()
+          PY
+
+      - name: Extract matched still pairs
+        shell: bash
+        run: |
+          # hd_time dvd_time, chosen from stable timing plateaus
+          while read hd dvd; do
+            tag=$(printf "%04d" "$hd")
+            ffmpeg -v error -ss "$dvd" -i dvd.avi -frames:v 1 "dvd-$tag.png"
+            ffmpeg -v error -ss "$hd"  -i hd.mp4  -frames:v 1 "hd-$tag.png"
+          done <<'EOF'
+          300 301.93
+          900 899.56
+          1500 1499.40
+          1800 1801.17
+          2200 2200.59
+          2500 2500.59
+          EOF
+
+      - name: Localize persistent unexplained difference
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import cv2, glob, json, numpy as np
+
+          tags=["0300","0900","1500","1800","2200","2500"]
+          diffs=[]
+          transforms=[]
+          tile_rows=9
+          tile_cols=16
+
+          for tag in tags:
+              dvd=cv2.imread(f"dvd-{tag}.png",cv2.IMREAD_GRAYSCALE)[6:470,0:848]
+              hd=cv2.imread(f"hd-{tag}.png",cv2.IMREAD_GRAYSCALE)[4:1076,10:1914]
+
+              up=cv2.resize(dvd,(hd.shape[1],hd.shape[0]),interpolation=cv2.INTER_CUBIC)
+
+              # Register from features across the full picture, then use robust
+              # RANSAC so a small persistent overlay cannot dominate the solve.
+              pts=cv2.goodFeaturesToTrack(up,maxCorners=1800,qualityLevel=0.01,minDistance=7,blockSize=5)
+              if pts is None:
+                  raise RuntimeError(f"no features for {tag}")
+              nxt,status,err=cv2.calcOpticalFlowPyrLK(up,hd,pts,None,winSize=(31,31),maxLevel=4)
+              good=status.reshape(-1)==1
+              src=pts.reshape(-1,2)[good]
+              dst=nxt.reshape(-1,2)[good]
+              M,inliers=cv2.estimateAffinePartial2D(src,dst,method=cv2.RANSAC,ransacReprojThreshold=2.0,maxIters=5000,confidence=0.999,refineIters=50)
+              if M is None:
+                  raise RuntimeError(f"affine failed for {tag}")
+              warped=cv2.warpAffine(up,M,(hd.shape[1],hd.shape[0]),flags=cv2.INTER_CUBIC)
+              diff=cv2.absdiff(warped,hd).astype(np.float32)
+
+              # Remove broad encode/contrast mismatch with a large local median.
+              smooth=cv2.GaussianBlur(diff,(0,0),sigmaX=18,sigmaY=18)
+              excess=np.maximum(diff-smooth,0)
+              diffs.append(excess)
+              transforms.append({
+                  "tag":tag,
+                  "matrix":M.tolist(),
+                  "inliers":int(inliers.sum()) if inliers is not None else None,
+                  "matches":int(len(src)),
+                  "median_raw_diff":float(np.median(diff)),
+                  "mean_raw_diff":float(np.mean(diff)),
+              })
+
+          stack=np.stack(diffs,axis=0)
+          # Persistent anomaly score: median excess across six unrelated shots.
+          persistent=np.median(stack,axis=0)
+
+          # Tile map is useful even if the bug shape itself is translucent.
+          H,W=persistent.shape
+          tile_stats=[]
+          for r in range(tile_rows):
+              y0=round(r*H/tile_rows); y1=round((r+1)*H/tile_rows)
+              for c in range(tile_cols):
+                  x0=round(c*W/tile_cols); x1=round((c+1)*W/tile_cols)
+                  region=persistent[y0:y1,x0:x1]
+                  tile_stats.append({
+                      "row":r,"col":c,
+                      "x0":x0,"y0":y0,"x1":x1,"y1":y1,
+                      "mean":float(np.mean(region)),
+                      "p95":float(np.percentile(region,95)),
+                      "p99":float(np.percentile(region,99)),
+                  })
+          tile_stats.sort(key=lambda x:x["p99"],reverse=True)
+
+          # Threshold relative to global persistent-difference distribution.
+          med=float(np.median(persistent))
+          mad=float(np.median(np.abs(persistent-med)))+1e-6
+          threshold=med+8.0*1.4826*mad
+          binary=(persistent>threshold).astype(np.uint8)*255
+          binary=cv2.morphologyEx(binary,cv2.MORPH_CLOSE,np.ones((9,9),np.uint8))
+          binary=cv2.morphologyEx(binary,cv2.MORPH_OPEN,np.ones((3,3),np.uint8))
+
+          n,labels,stats,cent=cv2.connectedComponentsWithStats(binary,8)
+          comps=[]
+          for i in range(1,n):
+              x,y,w,h,area=[int(v) for v in stats[i]]
+              if area<40: continue
+              comps.append({
+                  "x":x,"y":y,"w":w,"h":h,"area":area,
+                  "cx":float(cent[i][0]),"cy":float(cent[i][1]),
+                  "mean_persistent":float(np.mean(persistent[labels==i])),
+              })
+          comps.sort(key=lambda x:(x["area"]*x["mean_persistent"]),reverse=True)
+
+          print("=== REGISTRATION PER SAMPLE JSON ===")
+          print(json.dumps(transforms,indent=2))
+          print("=== TOP PERSISTENT-DIFFERENCE TILES JSON ===")
+          print(json.dumps(tile_stats[:20],indent=2))
+          print("=== PERSISTENT DIFFERENCE COMPONENTS JSON ===")
+          print(json.dumps({
+              "frame_shape":[H,W],
+              "global_median":med,
+              "global_mad":mad,
+              "threshold":threshold,
+              "components":comps[:20],
+          },indent=2))
+          PY

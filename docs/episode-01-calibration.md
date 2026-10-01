@@ -134,3 +134,26 @@ This is small enough to support the preservation-first strategy: native 1080p pi
 Registration quality varied by sample. The 1500 s sample produced an implausible affine transform with only 19 inliers and must be rejected by production quality gates. Other samples produced plausible transforms with substantially more inliers. Restoration code must therefore validate transform scale/rotation/translation/inlier support and fall back or re-estimate rather than applying every estimated transform blindly.
 
 Patch-region residuals before restoration were much larger than many seam-ring residuals, supporting the interpretation that the isolated region contains a real persistent overlay rather than merely global encode mismatch.
+
+
+## First restored-frame prototype
+
+Four registered episode 1 samples were rendered as side-by-side comparisons:
+
+1. original 1080p with network bug;
+2. registered DVD donor;
+3. hard rectangular replacement;
+4. feathered rectangular replacement.
+
+The visual review confirms that the registered DVD donor is potentially usable, but a rectangular patch is not an acceptable production strategy.
+
+Findings:
+
+- Hard rectangular replacement produces obvious rectangular seams and is rejected.
+- Feathering the rectangle reduces seam severity but still modifies far more native 1080p picture than necessary.
+- The 2200 s sample is already visually encouraging after feathering, showing that the donor can plausibly blend into the HD master when registration and local tone are favorable.
+- The 900 s sample reveals a major failure mode: simple mean/std photometric matching over the surrounding ring can hit its clamp limits and create a visible tonal slab. Photometric matching must therefore be quality-gated and more robust.
+- The restoration mask should follow the actual network-logo silhouette, including only a very small antialias/feather margin, rather than using the 214×92 conservative bounding box as the compositing mask.
+- The conservative bounding box remains useful as a search/processing ROI, not as the area to replace.
+
+Current direction: derive a persistent logo-shaped alpha mask inside the ROI, fit donor-to-HD tone using robust paired pixels outside the logo, reject pathological fits, and modify only masked pixels.

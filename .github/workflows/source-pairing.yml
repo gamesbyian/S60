@@ -81,12 +81,24 @@ jobs:
               return sorted(files, key=str.lower)
 
           # Conservative parsers, from strongest to weakest.
+          VIDEO_EXTS = {".avi", ".mp4", ".mkv", ".m4v", ".mov"}
+
           patterns = [
               re.compile(r"(?i)\bS(?:eason)?\s*0?1[ ._-]*E(?:p(?:isode)?)?\s*0?(\d{1,2})\b"),
               re.compile(r"(?i)\b0?1\s*[xX]\s*0?(\d{1,2})\b"),
               re.compile(r"(?i)\bE(?:p(?:isode)?)?\s*0?(\d{1,2})\b"),
               re.compile(r"(?i)\bEpisode[ ._-]*0?(\d{1,2})\b"),
+              re.compile(r"(?i)^Studio 60\s*-\s*0?(\d{1,2})\s*-"),
           ]
+
+          def is_episode_video(path):
+              base = path.rsplit("/", 1)[-1]
+              ext = "." + base.rsplit(".", 1)[-1].lower() if "." in base else ""
+              if ext not in VIDEO_EXTS:
+                  return False
+              if "commentary audio track" in base.lower():
+                  return False
+              return True
 
           def episode_number(path):
               base = path.rsplit("/", 1)[-1]
@@ -105,6 +117,8 @@ jobs:
               by_ep = defaultdict(list)
               misses = []
               for path in files:
+                  if not is_episode_video(path):
+                      continue
                   ep, parser = episode_number(path)
                   if ep is None:
                       misses.append(path)

@@ -1,0 +1,169 @@
+name: Episode 1 boundary and spatial registration
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/episode-01-boundary-spatial.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      FTP_HOST: wood.seedhost.eu
+      FTP_USER: ianseeds
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+
+    steps:
+      - name: Install tools
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install --quiet numpy opencv-python-headless
+
+      - name: Download episode 1 pair
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib, os
+          files={
+            "dvd.avi":"/downloads/S60/DVD/Studio 60 - 01 - Pilot.avi",
+            "hd.mp4":"/downloads/S60/1080p/Studio 60 S01E01.mp4",
+          }
+          ftp=ftplib.FTP()
+          ftp.connect(os.environ["FTP_HOST"],21,timeout=30)
+          ftp.login(os.environ["FTP_USER"],os.environ["FTP_PASSWORD"])
+          ftp.voidcmd("TYPE I")
+          for local,remote in files.items():
+              with open(local,"wb") as fh:
+                  ftp.retrbinary("RETR "+remote, fh.write, blocksize=1024*1024)
+          ftp.quit()
+          PY
+
+      - name: Extract low-rate mono audio
+        shell: bash
+        run: |
+          ffmpeg -v error -i dvd.avi -map 0:a:0 -ac 1 -ar 1000 -f s16le dvd.pcm
+          ffmpeg -v error -i hd.mp4  -map 0:a:0 -ac 1 -ar 1000 -f s16le hd.pcm
+
+      - name: Refine timing boundaries
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, numpy as np
+
+          sr=1000; env_hz=100; block=sr//env_hz
+          def env(path):
+              x=np.fromfile(path,dtype="<i2").astype(np.float32)
+              n=(len(x)//block)*block
+              x=x[:n].reshape(-1,block)
+              e=np.sqrt(np.mean(x*x,axis=1))
+              e=np.log1p(e)
+              return (e-np.mean(e))/(np.std(e)+1e-6)
+
+          dvd=env("dvd.pcm"); hd=env("hd.pcm")
+          half_template=4; search_radius=4
+          windows=[(520,620),(1120,1220),(1600,1760),(1960,2060)]
+          rows=[]
+          for lo,hi in windows:
+              for t in range(lo,hi+1,5):
+                  hs=int((t-half_template)*env_hz); he=int((t+half_template)*env_hz)
+                  if hs<0 or he>len(hd): continue
+                  template=hd[hs:he]
+                  template=(template-template.mean())/(template.std()+1e-6)
+                  ds=max(0,int((t-half_template-search_radius)*env_hz))
+                  de=min(len(dvd),int((t+half_template+search_radius)*env_hz))
+                  search=dvd[ds:de]
+                  search=(search-search.mean())/(search.std()+1e-6)
+                  corr=np.correlate(search,template,mode="valid")
+                  best=int(np.argmax(corr))
+                  dvd_start=(ds+best)/env_hz
+                  offset=dvd_start-(t-half_template)
+                  score=float(corr[best]/len(template))
+                  rows.append({"anchor":t,"offset":round(offset,3),"score":round(score,4)})
+          print("=== REFINED BOUNDARY MAP JSON ===")
+          print(json.dumps(rows,indent=2))
+          PY
+
+      - name: Extract matched stills
+        shell: bash
+        run: |
+          # Stable plateau: HD 900s corresponds to DVD ~899.56s.
+          ffmpeg -v error -ss 899.56 -i dvd.avi -frames:v 1 dvd.png
+          ffmpeg -v error -ss 900.00 -i hd.mp4  -frames:v 1 hd.png
+
+      - name: Estimate spatial transform
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import cv2, json, numpy as np
+
+          dvd=cv2.imread("dvd.png",cv2.IMREAD_GRAYSCALE)
+          hd=cv2.imread("hd.png",cv2.IMREAD_GRAYSCALE)
+
+          # Remove the tiny encoded edge bands observed in cropdetect.
+          dvd=dvd[6:470,0:848]
+          hd=hd[4:1076,10:1914]
+
+          # Start with aspect-preserving resize, then estimate residual affine.
+          sx=hd.shape[1]/dvd.shape[1]
+          sy=hd.shape[0]/dvd.shape[0]
+          dvd_up=cv2.resize(dvd,(hd.shape[1],hd.shape[0]),interpolation=cv2.INTER_CUBIC)
+
+          # Mask the likely network-bug neighborhood in the HD source so it
+          # cannot dominate registration. Conservative top-right exclusion.
+          mask=np.ones_like(hd,dtype=np.uint8)*255
+          mask[0:260, hd.shape[1]-420:hd.shape[1]]=0
+
+          pts=cv2.goodFeaturesToTrack(dvd_up,maxCorners=1200,qualityLevel=0.01,minDistance=8,blockSize=5)
+          if pts is None:
+              raise RuntimeError("no features detected")
+          pts=pts.reshape(-1,1,2)
+          nxt,status,err=cv2.calcOpticalFlowPyrLK(dvd_up,hd,pts,None,winSize=(31,31),maxLevel=4)
+          good=(status.reshape(-1)==1)
+          src=pts.reshape(-1,2)[good]
+          dst=nxt.reshape(-1,2)[good]
+
+          # Discard matches landing in the excluded network-bug zone.
+          keep=[]
+          for i,(x,y) in enumerate(dst):
+              xi=int(round(x)); yi=int(round(y))
+              keep.append(0<=xi<mask.shape[1] and 0<=yi<mask.shape[0] and mask[yi,xi]>0)
+          keep=np.array(keep,dtype=bool)
+          src=src[keep]; dst=dst[keep]
+
+          M,inliers=cv2.estimateAffinePartial2D(src,dst,method=cv2.RANSAC,ransacReprojThreshold=2.0,maxIters=5000,confidence=0.999,refineIters=50)
+          if M is None:
+              raise RuntimeError("affine estimation failed")
+          inlier_count=int(inliers.sum()) if inliers is not None else None
+
+          a,b,tx=M[0]; c,d,ty=M[1]
+          scale=float((np.hypot(a,c)+np.hypot(b,d))/2)
+          rotation=float(np.degrees(np.arctan2(c,a)))
+
+          warped=cv2.warpAffine(dvd_up,M,(hd.shape[1],hd.shape[0]),flags=cv2.INTER_CUBIC)
+          diff=cv2.absdiff(warped,hd)
+          valid=mask>0
+          result={
+              "dvd_cropped_shape":[int(x) for x in dvd.shape],
+              "hd_cropped_shape":[int(x) for x in hd.shape],
+              "initial_scale_x":sx,
+              "initial_scale_y":sy,
+              "affine_matrix":M.tolist(),
+              "residual_scale":scale,
+              "rotation_degrees":rotation,
+              "translation_x":float(tx),
+              "translation_y":float(ty),
+              "feature_matches":int(len(src)),
+              "ransac_inliers":inlier_count,
+              "mean_abs_diff_excluding_bug_zone":float(np.mean(diff[valid])),
+              "median_abs_diff_excluding_bug_zone":float(np.median(diff[valid])),
+          }
+          print("=== SPATIAL REGISTRATION JSON ===")
+          print(json.dumps(result,indent=2))
+          PY

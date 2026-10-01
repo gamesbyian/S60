@@ -83,3 +83,37 @@ A denser 60-second audio-envelope correlation pass confirms stable timing platea
 | 2040–2640 s | +0.590 s |
 
 Correlation scores across these anchors were generally strong. The working model is therefore several discrete edit/timing changes. The next pass should localize each boundary more precisely, then solve spatial registration within each stable segment.
+
+
+## Refined discontinuity regions
+
+Five-second audio-correlation probes narrowed the timing changes:
+
+- First transition: stable at +1.930 s through 555 s; by 565–570 s it has settled at about -0.440 s. The 560 s anchor is inside the discontinuity.
+- Second transition: stable at -0.440 s through 1145 s; settled at -0.600 s by 1150 s.
+- Third transition: stable at -0.600 s through 1660 s; 1665–1685 s is transitional; settled at +1.170 s by 1690 s.
+- A later transition from +1.170 s to +0.590 s occurs around the 2,000 s region and should be narrowed further only if needed for production mapping.
+
+These are discrete timeline edits rather than drift.
+
+## Spatial registration result
+
+A matched still in the stable ~900 s plateau was registered after applying the measured active-picture crops. The DVD crop was 848×464 and the 1080p crop was 1904×1072.
+
+The initial resize needed different horizontal and vertical scale factors because the two encodes use slightly different active-picture geometry:
+
+- Initial X scale: 2.245283
+- Initial Y scale: 2.310345
+
+After that coarse resize, robust feature matching and RANSAC estimated a small residual transform:
+
+- Residual uniform scale: 1.0162645
+- Rotation: -0.0320°
+- Translation X: +2.666 px
+- Translation Y: -4.390 px
+- Feature matches considered: 425
+- RANSAC inliers: 79
+- Median absolute luma difference outside the masked bug zone: 4
+- Mean absolute luma difference outside the masked bug zone: 12.616
+
+This indicates that the DVD and 1080p pictures are geometrically very close after active-picture normalization. A lightweight affine registration is likely sufficient within stable timeline segments. The low median residual is promising for using DVD-derived content only inside the bug mask, while retaining native 1080p pixels everywhere else.

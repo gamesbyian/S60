@@ -81,15 +81,18 @@ Use for:
 Do not use it to replace unobscured 1080p content.
 
 ### 720p
-Role: secondary reference.
+Role: secondary reference only.
+
+The 720p versions also contain the network bug, so they are not a clean donor for pixels obscured in the 1080p source.
 
 Potential uses:
 - resolve ambiguous DVD↔1080p alignment;
 - determine whether an apparent difference is source-specific;
-- provide a better donor than DVD if a region is clean in 720p;
-- validate bug shape, timing, framing, or color.
+- validate bug shape, timing, framing, opacity, or color;
+- compare how the same overlay was encoded at a different resolution;
+- help distinguish overlay artifacts from compression or registration artifacts.
 
-Before finalizing the restoration method, inspect whether the 720p source has the same network bug and whether its bug placement/content differs. If any pixels hidden in 1080p are clean in 720p, it may be a substantially better donor than DVD for those pixels.
+The DVD remains the canonical clean donor for reconstruction unless another genuinely clean source is discovered.
 
 ## Technical work plan
 
@@ -278,6 +281,6 @@ Key current conclusions:
 2. Produce several actual restored-frame prototypes.
 3. Compare hard-mask, feathered-mask, and local color/luma-matched compositing.
 4. Test temporal stability over short restored clips.
-5. Inspect the 720p source as a possible higher-quality clean donor for any region where it lacks the 1080p bug.
+5. Use the 720p source only as a secondary validation/reference source, since it also contains the network bug.
 6. Lock the minimum-quality final encode strategy only after the visual restoration method is proven.
 7. Generalize characterization and timeline mapping across all 22 episodes.

@@ -1,0 +1,186 @@
+name: Episode 1 restored-frame prototype
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/episode-01-restored-frame-prototype.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  prototype:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      FTP_HOST: wood.seedhost.eu
+      FTP_USER: ianseeds
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+
+    steps:
+      - name: Install tools
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install --quiet numpy opencv-python-headless
+
+      - name: Download episode 1 pair
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib, os
+          files={
+            "dvd.avi":"/downloads/S60/DVD/Studio 60 - 01 - Pilot.avi",
+            "hd.mp4":"/downloads/S60/1080p/Studio 60 S01E01.mp4",
+          }
+          ftp=ftplib.FTP()
+          ftp.connect(os.environ["FTP_HOST"],21,timeout=30)
+          ftp.login(os.environ["FTP_USER"],os.environ["FTP_PASSWORD"])
+          ftp.voidcmd("TYPE I")
+          for local,remote in files.items():
+              with open(local,"wb") as fh:
+                  ftp.retrbinary("RETR "+remote, fh.write, blocksize=1024*1024)
+          ftp.quit()
+          PY
+
+      - name: Extract matched RGB frames
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          # Exclude the known-bad 1500 s registration sample.
+          pairs=[(900,899.56),(1800,1801.17),(2200,2200.59),(2500,2500.59)]
+          for hd,dvd in pairs:
+              tag=f"{hd:04d}"
+              subprocess.run(["ffmpeg","-v","error","-ss",str(dvd),"-i","dvd.avi","-frames:v","1",f"dvd-{tag}.png"],check=True)
+              subprocess.run(["ffmpeg","-v","error","-ss",str(hd),"-i","hd.mp4","-frames:v","1",f"hd-{tag}.png"],check=True)
+          PY
+
+      - name: Build hard and feathered repair prototypes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import cv2, json, math, os, numpy as np
+
+          tags=["0900","1800","2200","2500"]
+          # Conservative full-frame bug box discovered by the focused mask pass.
+          full_bbox=(180,894,394,986)
+          # Convert to active-picture coordinates after HD crop [4:1076,10:1914].
+          bbox=(170,890,384,982)
+
+          os.makedirs("prototype",exist_ok=True)
+          results=[]
+
+          for tag in tags:
+              dvd_full=cv2.imread(f"dvd-{tag}.png",cv2.IMREAD_COLOR)
+              hd_full=cv2.imread(f"hd-{tag}.png",cv2.IMREAD_COLOR)
+              dvd=dvd_full[6:470,0:848]
+              hd=hd_full[4:1076,10:1914]
+              up=cv2.resize(dvd,(hd.shape[1],hd.shape[0]),interpolation=cv2.INTER_LANCZOS4)
+
+              gray_up=cv2.cvtColor(up,cv2.COLOR_BGR2GRAY)
+              gray_hd=cv2.cvtColor(hd,cv2.COLOR_BGR2GRAY)
+              pts=cv2.goodFeaturesToTrack(gray_up,maxCorners=1800,qualityLevel=0.01,minDistance=7,blockSize=5)
+              nxt,status,err=cv2.calcOpticalFlowPyrLK(gray_up,gray_hd,pts,None,winSize=(31,31),maxLevel=4)
+              good=status.reshape(-1)==1
+              src=pts.reshape(-1,2)[good]
+              dst=nxt.reshape(-1,2)[good]
+              x0,y0,x1,y1=bbox
+              keep=~((dst[:,0]>=x0)&(dst[:,0]<x1)&(dst[:,1]>=y0)&(dst[:,1]<y1))
+              src=src[keep]; dst=dst[keep]
+              M,inliers=cv2.estimateAffinePartial2D(src,dst,method=cv2.RANSAC,ransacReprojThreshold=2.0,maxIters=5000,confidence=0.999,refineIters=50)
+              if M is None:
+                  raise RuntimeError(f"registration failed for {tag}")
+
+              a,b,tx=M[0]; c,d,ty=M[1]
+              scale=(math.hypot(a,c)+math.hypot(b,d))/2
+              rotation=math.degrees(math.atan2(c,a))
+              inlier_count=int(inliers.sum()) if inliers is not None else 0
+              if not (0.94 <= scale <= 1.06 and abs(rotation)<=2.0 and abs(tx)<=80 and abs(ty)<=80 and inlier_count>=50):
+                  raise RuntimeError(f"registration sanity gate failed for {tag}: scale={scale}, rot={rotation}, tx={tx}, ty={ty}, inliers={inlier_count}")
+
+              donor=cv2.warpAffine(up,M,(hd.shape[1],hd.shape[0]),flags=cv2.INTER_LANCZOS4)
+
+              # Local photometric match using a ring around the repair box.
+              ring_outer=18
+              ring=np.zeros(hd.shape[:2],dtype=bool)
+              ring[max(0,y0-ring_outer):min(hd.shape[0],y1+ring_outer),
+                   max(0,x0-ring_outer):min(hd.shape[1],x1+ring_outer)]=True
+              ring[y0:y1,x0:x1]=False
+
+              donor_f=donor.astype(np.float32)
+              hd_f=hd.astype(np.float32)
+              matched=donor_f.copy()
+              channel_params=[]
+              for ch in range(3):
+                  s=donor_f[:,:,ch][ring]
+                  t=hd_f[:,:,ch][ring]
+                  sm=float(np.mean(s)); ss=float(np.std(s))+1e-6
+                  tm=float(np.mean(t)); ts=float(np.std(t))+1e-6
+                  gain=max(0.85,min(1.15,ts/ss))
+                  bias=max(-20.0,min(20.0,tm-gain*sm))
+                  matched[:,:,ch]=np.clip(donor_f[:,:,ch]*gain+bias,0,255)
+                  channel_params.append({"gain":gain,"bias":bias})
+              matched=matched.astype(np.uint8)
+
+              mask=np.zeros(hd.shape[:2],dtype=np.uint8)
+              mask[y0:y1,x0:x1]=255
+
+              hard=hd.copy()
+              hard[mask>0]=matched[mask>0]
+
+              feather=cv2.GaussianBlur(mask,(0,0),sigmaX=3.0,sigmaY=3.0).astype(np.float32)/255.0
+              feather3=feather[:,:,None]
+              soft=np.clip(hd_f*(1-feather3)+matched.astype(np.float32)*feather3,0,255).astype(np.uint8)
+
+              # Evaluate seam ring only. Lower hard/soft gradient jump is better.
+              def seam_metric(img):
+                  g=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY).astype(np.float32)
+                  gx=cv2.Sobel(g,cv2.CV_32F,1,0,ksize=3)
+                  gy=cv2.Sobel(g,cv2.CV_32F,0,1,ksize=3)
+                  mag=cv2.magnitude(gx,gy)
+                  edge=np.zeros_like(mask,dtype=bool)
+                  edge[max(0,y0-3):min(mask.shape[0],y1+3),max(0,x0-3):min(mask.shape[1],x1+3)]=True
+                  edge[y0+3:y1-3,x0+3:x1-3]=False
+                  return float(np.mean(mag[edge])), float(np.median(mag[edge]))
+
+              hd_seam=seam_metric(hd)
+              hard_seam=seam_metric(hard)
+              soft_seam=seam_metric(soft)
+
+              # Reinsert active picture into full-size frames for visual review.
+              hard_full=hd_full.copy(); hard_full[4:1076,10:1914]=hard
+              soft_full=hd_full.copy(); soft_full[4:1076,10:1914]=soft
+              donor_full=hd_full.copy(); donor_full[4:1076,10:1914]=donor
+
+              fx0,fy0,fx1,fy1=full_bbox
+              pad=50
+              X0=max(0,fx0-pad); Y0=max(0,fy0-pad); X1=min(1920,fx1+pad); Y1=min(1080,fy1+pad)
+              crop_original=hd_full[Y0:Y1,X0:X1]
+              crop_donor=donor_full[Y0:Y1,X0:X1]
+              crop_hard=hard_full[Y0:Y1,X0:X1]
+              crop_soft=soft_full[Y0:Y1,X0:X1]
+              contact=np.hstack([crop_original,crop_donor,crop_hard,crop_soft])
+              cv2.imwrite(f"prototype/{tag}-comparison.png",contact)
+
+              results.append({
+                  "tag":tag,
+                  "registration":{"scale":scale,"rotation_deg":rotation,"tx":float(tx),"ty":float(ty),"inliers":inlier_count},
+                  "photometric_match":channel_params,
+                  "seam_gradient_mean":{"original":hd_seam[0],"hard":hard_seam[0],"feather":soft_seam[0]},
+                  "seam_gradient_median":{"original":hd_seam[1],"hard":hard_seam[1],"feather":soft_seam[1]},
+                  "comparison_columns":["original_1080p","registered_DVD_donor","hard_patch","feathered_patch"]
+              })
+
+          print("=== RESTORED FRAME PROTOTYPE JSON ===")
+          print(json.dumps({"bbox_full_1080p":full_bbox,"results":results},indent=2))
+          PY
+
+      - name: Upload visual comparisons
+        uses: actions/upload-artifact@v4
+        with:
+          name: episode-01-restored-frame-prototype
+          path: prototype/*.png
+          if-no-files-found: error

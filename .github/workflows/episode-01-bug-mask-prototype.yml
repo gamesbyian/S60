@@ -1,0 +1,167 @@
+name: Episode 1 bug mask prototype
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/episode-01-bug-mask-prototype.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  prototype:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      FTP_HOST: wood.seedhost.eu
+      FTP_USER: ianseeds
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+
+    steps:
+      - name: Install tools
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install --quiet numpy opencv-python-headless
+
+      - name: Download episode 1 pair
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib, os
+          files={
+            "dvd.avi":"/downloads/S60/DVD/Studio 60 - 01 - Pilot.avi",
+            "hd.mp4":"/downloads/S60/1080p/Studio 60 S01E01.mp4",
+          }
+          ftp=ftplib.FTP()
+          ftp.connect(os.environ["FTP_HOST"],21,timeout=30)
+          ftp.login(os.environ["FTP_USER"],os.environ["FTP_PASSWORD"])
+          ftp.voidcmd("TYPE I")
+          for local,remote in files.items():
+              with open(local,"wb") as fh:
+                  ftp.retrbinary("RETR "+remote, fh.write, blocksize=1024*1024)
+          ftp.quit()
+          PY
+
+      - name: Extract matched still pairs
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          pairs=[(300,301.93),(900,899.56),(1500,1499.40),(1800,1801.17),(2200,2200.59),(2500,2500.59)]
+          for hd,dvd in pairs:
+              tag=f"{hd:04d}"
+              subprocess.run(["ffmpeg","-v","error","-ss",str(dvd),"-i","dvd.avi","-frames:v","1",f"dvd-{tag}.png"],check=True)
+              subprocess.run(["ffmpeg","-v","error","-ss",str(hd),"-i","hd.mp4","-frames:v","1",f"hd-{tag}.png"],check=True)
+          PY
+
+      - name: Build focused bug mask and patch diagnostics
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import cv2, json, numpy as np
+
+          tags=["0300","0900","1500","1800","2200","2500"]
+          aligned=[]
+          hd_frames=[]
+          roi_diffs=[]
+
+          # Candidate ROI from the previous persistent-difference tile map,
+          # expressed in active-picture coordinates.
+          rx0,ry0,rx1,ry1 = 80,780,430,1072
+
+          transforms=[]
+          for tag in tags:
+              dvd=cv2.imread(f"dvd-{tag}.png",cv2.IMREAD_GRAYSCALE)[6:470,0:848]
+              hd=cv2.imread(f"hd-{tag}.png",cv2.IMREAD_GRAYSCALE)[4:1076,10:1914]
+              up=cv2.resize(dvd,(hd.shape[1],hd.shape[0]),interpolation=cv2.INTER_CUBIC)
+
+              pts=cv2.goodFeaturesToTrack(up,maxCorners=1800,qualityLevel=0.01,minDistance=7,blockSize=5)
+              nxt,status,err=cv2.calcOpticalFlowPyrLK(up,hd,pts,None,winSize=(31,31),maxLevel=4)
+              good=status.reshape(-1)==1
+              src=pts.reshape(-1,2)[good]
+              dst=nxt.reshape(-1,2)[good]
+              # Exclude candidate bug ROI from transform estimation.
+              keep=~((dst[:,0]>=rx0)&(dst[:,0]<rx1)&(dst[:,1]>=ry0)&(dst[:,1]<ry1))
+              src=src[keep]; dst=dst[keep]
+              M,inliers=cv2.estimateAffinePartial2D(src,dst,method=cv2.RANSAC,ransacReprojThreshold=2.0,maxIters=5000,confidence=0.999,refineIters=50)
+              if M is None:
+                  raise RuntimeError(f"affine failed {tag}")
+              warped=cv2.warpAffine(up,M,(hd.shape[1],hd.shape[0]),flags=cv2.INTER_CUBIC)
+              aligned.append(warped)
+              hd_frames.append(hd)
+              transforms.append({"tag":tag,"matrix":M.tolist(),"inliers":int(inliers.sum())})
+
+              diff=cv2.absdiff(warped,hd).astype(np.float32)
+              smooth=cv2.GaussianBlur(diff,(0,0),sigmaX=18,sigmaY=18)
+              excess=np.maximum(diff-smooth,0)
+              roi_diffs.append(excess[ry0:ry1,rx0:rx1])
+
+          stack=np.stack(roi_diffs)
+          persistent=np.median(stack,axis=0)
+          # Use empirical high percentile instead of MAD, since the global
+          # residual distribution is zero-inflated.
+          vals=persistent[persistent>0]
+          threshold=float(np.percentile(vals,97.5)) if vals.size else 0.0
+          mask=(persistent>=threshold).astype(np.uint8)*255
+          mask=cv2.morphologyEx(mask,cv2.MORPH_CLOSE,np.ones((11,11),np.uint8))
+          mask=cv2.dilate(mask,np.ones((9,9),np.uint8),iterations=1)
+
+          n,labels,stats,cent=cv2.connectedComponentsWithStats(mask,8)
+          comps=[]
+          for i in range(1,n):
+              x,y,w,h,area=[int(v) for v in stats[i]]
+              if area<80: continue
+              comps.append({"x":x+rx0,"y":y+ry0,"w":w,"h":h,"area":area})
+          comps.sort(key=lambda c:c["area"],reverse=True)
+
+          # Build a conservative union box around the substantial components
+          # in the candidate lower-left ROI.
+          substantial=[c for c in comps if c["area"]>=150]
+          if substantial:
+              x0=min(c["x"] for c in substantial)
+              y0=min(c["y"] for c in substantial)
+              x1=max(c["x"]+c["w"] for c in substantial)
+              y1=max(c["y"]+c["h"] for c in substantial)
+              pad=12
+              bbox=[max(0,x0-pad),max(0,y0-pad),min(1904,x1+pad),min(1072,y1+pad)]
+          else:
+              bbox=None
+
+          # Patch-quality diagnostic on each matched still:
+          # compare original HD-vs-DVD residual inside bbox before and after
+          # substituting the registered DVD pixels. After substitution the
+          # residual to the clean reference should collapse by construction;
+          # report seam mismatch on a 6-pixel ring outside the patch instead.
+          patch_stats=[]
+          if bbox:
+              x0,y0,x1,y1=bbox
+              for tag,clean,hd in zip(tags,aligned,hd_frames):
+                  before=cv2.absdiff(clean,hd)
+                  inside=before[y0:y1,x0:x1]
+                  ring=np.zeros_like(hd,dtype=bool)
+                  outer=10
+                  ring[max(0,y0-outer):min(hd.shape[0],y1+outer),max(0,x0-outer):min(hd.shape[1],x1+outer)]=True
+                  ring[y0:y1,x0:x1]=False
+                  patch_stats.append({
+                      "tag":tag,
+                      "bbox_mean_abs_diff_before":float(np.mean(inside)),
+                      "bbox_median_abs_diff_before":float(np.median(inside)),
+                      "seam_ring_mean_abs_diff":float(np.mean(before[ring])),
+                      "seam_ring_median_abs_diff":float(np.median(before[ring])),
+                  })
+
+          print("=== FOCUSED BUG MASK JSON ===")
+          print(json.dumps({
+              "active_picture_shape":[1072,1904],
+              "candidate_roi":[rx0,ry0,rx1,ry1],
+              "threshold":threshold,
+              "components":comps[:20],
+              "conservative_bbox_active_picture":bbox,
+              "conservative_bbox_full_1080p":([bbox[0]+10,bbox[1]+4,bbox[2]+10,bbox[3]+4] if bbox else None),
+              "transforms":transforms,
+              "patch_stats":patch_stats,
+          },indent=2))
+          PY

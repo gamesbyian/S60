@@ -60,9 +60,9 @@ jobs:
         shell: bash
         run: |
           echo "=== DVD FRAME RATE / DIMENSIONS ==="
-          ffprobe -v error -select_streams v:0 -count_frames             -show_entries stream=width,height,pix_fmt,sample_aspect_ratio,display_aspect_ratio,r_frame_rate,avg_frame_rate,time_base,duration,nb_frames,nb_read_frames             -of default=nw=1 dvd.avi
+          ffprobe -v error -select_streams v:0 -show_entries stream=width,height,pix_fmt,sample_aspect_ratio,display_aspect_ratio,r_frame_rate,avg_frame_rate,time_base,duration,nb_frames             -of default=nw=1 dvd.avi
           echo "=== 1080P FRAME RATE / DIMENSIONS ==="
-          ffprobe -v error -select_streams v:0 -count_frames             -show_entries stream=width,height,pix_fmt,sample_aspect_ratio,display_aspect_ratio,r_frame_rate,avg_frame_rate,time_base,duration,nb_frames,nb_read_frames             -of default=nw=1 hd.mp4
+          ffprobe -v error -select_streams v:0 -show_entries stream=width,height,pix_fmt,sample_aspect_ratio,display_aspect_ratio,r_frame_rate,avg_frame_rate,time_base,duration,nb_frames             -of default=nw=1 hd.mp4
 
           echo "=== DVD CROPDETECT samples ==="
           for t in 60 600 1200 1800; do

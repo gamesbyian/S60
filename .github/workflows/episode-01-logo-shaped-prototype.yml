@@ -1,0 +1,274 @@
+name: Episode 1 logo-shaped repair prototype
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/episode-01-logo-shaped-prototype.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  prototype:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      FTP_HOST: wood.seedhost.eu
+      FTP_USER: ianseeds
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+
+    steps:
+      - name: Install tools
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install --quiet numpy opencv-python-headless
+
+      - name: Download episode 1 pair
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib, os
+          files={
+            "dvd.avi":"/downloads/S60/DVD/Studio 60 - 01 - Pilot.avi",
+            "hd.mp4":"/downloads/S60/1080p/Studio 60 S01E01.mp4",
+          }
+          ftp=ftplib.FTP()
+          ftp.connect(os.environ["FTP_HOST"],21,timeout=30)
+          ftp.login(os.environ["FTP_USER"],os.environ["FTP_PASSWORD"])
+          ftp.voidcmd("TYPE I")
+          for local,remote in files.items():
+              with open(local,"wb") as fh:
+                  ftp.retrbinary("RETR "+remote, fh.write, blocksize=1024*1024)
+          ftp.quit()
+          PY
+
+      - name: Extract matched RGB frames
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          pairs=[
+              (300,301.93),
+              (900,899.56),
+              (1500,1499.40),
+              (1800,1801.17),
+              (2200,2200.59),
+              (2500,2500.59),
+          ]
+          for hd,dvd in pairs:
+              tag=f"{hd:04d}"
+              subprocess.run(["ffmpeg","-v","error","-ss",str(dvd),"-i","dvd.avi","-frames:v","1",f"dvd-{tag}.png"],check=True)
+              subprocess.run(["ffmpeg","-v","error","-ss",str(hd),"-i","hd.mp4","-frames:v","1",f"hd-{tag}.png"],check=True)
+          PY
+
+      - name: Build persistent logo mask and repair samples
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import cv2, json, math, os, numpy as np
+
+          tags=["0300","0900","1500","1800","2200","2500"]
+          # Active-picture coordinates corresponding to full-frame x=180..394,y=894..986.
+          x0,y0,x1,y1 = 170,890,384,982
+          os.makedirs("prototype",exist_ok=True)
+
+          def register(dvd,hd):
+              gray_d=cv2.cvtColor(dvd,cv2.COLOR_BGR2GRAY)
+              gray_h=cv2.cvtColor(hd,cv2.COLOR_BGR2GRAY)
+              pts=cv2.goodFeaturesToTrack(gray_d,maxCorners=1800,qualityLevel=0.01,minDistance=7,blockSize=5)
+              if pts is None:
+                  return None,None
+              nxt,status,err=cv2.calcOpticalFlowPyrLK(gray_d,gray_h,pts,None,winSize=(31,31),maxLevel=4)
+              good=status.reshape(-1)==1
+              src=pts.reshape(-1,2)[good]
+              dst=nxt.reshape(-1,2)[good]
+              keep=~((dst[:,0]>=x0)&(dst[:,0]<x1)&(dst[:,1]>=y0)&(dst[:,1]<y1))
+              src=src[keep]; dst=dst[keep]
+              M,inliers=cv2.estimateAffinePartial2D(src,dst,method=cv2.RANSAC,ransacReprojThreshold=2.0,maxIters=5000,confidence=0.999,refineIters=50)
+              if M is None:
+                  return None,None
+              a,b,tx=M[0]; c,d,ty=M[1]
+              scale=(math.hypot(a,c)+math.hypot(b,d))/2
+              rot=math.degrees(math.atan2(c,a))
+              n=int(inliers.sum()) if inliers is not None else 0
+              ok=(0.94<=scale<=1.06 and abs(rot)<=2.0 and abs(tx)<=80 and abs(ty)<=80 and n>=50)
+              return M,{"ok":ok,"scale":scale,"rotation_deg":rot,"tx":float(tx),"ty":float(ty),"inliers":n}
+
+          registered={}
+          meta={}
+          residuals=[]
+          for tag in tags:
+              dvd_full=cv2.imread(f"dvd-{tag}.png",cv2.IMREAD_COLOR)
+              hd_full=cv2.imread(f"hd-{tag}.png",cv2.IMREAD_COLOR)
+              dvd=dvd_full[6:470,0:848]
+              hd=hd_full[4:1076,10:1914]
+              up=cv2.resize(dvd,(hd.shape[1],hd.shape[0]),interpolation=cv2.INTER_LANCZOS4)
+              M,m=register(up,hd)
+              meta[tag]=m
+              if M is None or not m["ok"]:
+                  continue
+              donor=cv2.warpAffine(up,M,(hd.shape[1],hd.shape[0]),flags=cv2.INTER_LANCZOS4)
+              registered[tag]=(donor,hd,hd_full)
+
+              dg=cv2.cvtColor(donor,cv2.COLOR_BGR2GRAY).astype(np.float32)
+              hg=cv2.cvtColor(hd,cv2.COLOR_BGR2GRAY).astype(np.float32)
+              raw=np.abs(dg-hg)
+              # Remove broad local mastering/illumination mismatch so the
+              # static overlay survives while scene differences recede.
+              broad=cv2.GaussianBlur(raw,(0,0),sigmaX=14,sigmaY=14)
+              excess=np.maximum(raw-broad,0)
+              residuals.append(excess[y0:y1,x0:x1])
+
+          if len(residuals)<3:
+              raise RuntimeError(f"too few valid registrations: {len(residuals)}")
+
+          persistent=np.median(np.stack(residuals),axis=0)
+          nz=persistent[persistent>0]
+          # High threshold isolates the logo strokes; keep only the largest
+          # connected component, then expand slightly for antialias/translucency.
+          threshold=float(np.percentile(nz,94.0)) if nz.size else 0.0
+          seed=(persistent>=threshold).astype(np.uint8)*255
+          seed=cv2.morphologyEx(seed,cv2.MORPH_CLOSE,np.ones((5,5),np.uint8))
+          n,labels,stats,cent=cv2.connectedComponentsWithStats(seed,8)
+          candidates=[]
+          for i in range(1,n):
+              area=int(stats[i,cv2.CC_STAT_AREA])
+              if area>=20:
+                  candidates.append((area,i))
+          if not candidates:
+              raise RuntimeError("no logo component found")
+          candidates.sort(reverse=True)
+          # Include substantial neighbors close to the dominant component so
+          # '.com' and separated logo elements are retained.
+          main_i=candidates[0][1]
+          main_stats=stats[main_i]
+          mx,my,mw,mh=[int(v) for v in main_stats[:4]]
+          union=np.zeros_like(seed)
+          for area,i in candidates:
+              sx,sy,sw,sh=[int(v) for v in stats[i][:4]]
+              dx=max(0,max(mx-sx-sw,sx-mx-mw))
+              dy=max(0,max(my-sy-sh,sy-my-mh))
+              if area>=35 and dx<=45 and dy<=20:
+                  union[labels==i]=255
+          union=cv2.dilate(union,np.ones((5,5),np.uint8),iterations=1)
+
+          full_binary=np.zeros((1072,1904),dtype=np.uint8)
+          full_binary[y0:y1,x0:x1]=union
+          alpha=cv2.GaussianBlur(full_binary,(0,0),sigmaX=1.35,sigmaY=1.35).astype(np.float32)/255.0
+          alpha=np.clip(alpha,0,1)
+          changed=int(np.count_nonzero(alpha>0.01))
+          strong=int(np.count_nonzero(alpha>0.5))
+
+          # Robust paired-pixel photometric fit from a narrow annulus outside
+          # the logo. Iterative clipping avoids high-contrast scene edges.
+          dil=cv2.dilate(full_binary,np.ones((21,21),np.uint8),iterations=1)>0
+          logo=full_binary>0
+          ring=dil & (~logo)
+
+          outputs=[]
+          for tag,(donor,hd,hd_full) in registered.items():
+              donor_f=donor.astype(np.float32)
+              hd_f=hd.astype(np.float32)
+              matched=donor_f.copy()
+              fits=[]
+              fit_ok=True
+
+              gray=cv2.cvtColor(hd,cv2.COLOR_BGR2GRAY)
+              gx=cv2.Sobel(gray,cv2.CV_32F,1,0,ksize=3)
+              gy=cv2.Sobel(gray,cv2.CV_32F,0,1,ksize=3)
+              grad=cv2.magnitude(gx,gy)
+              sample_mask=ring & (grad<20)
+
+              for ch in range(3):
+                  x=donor_f[:,:,ch][sample_mask]
+                  y=hd_f[:,:,ch][sample_mask]
+                  valid=(x>8)&(x<247)&(y>8)&(y<247)
+                  x=x[valid]; y=y[valid]
+                  if len(x)<100:
+                      fit_ok=False
+                      gain=1.0; bias=0.0
+                  else:
+                      keep=np.ones(len(x),dtype=bool)
+                      gain=1.0; bias=0.0
+                      for _ in range(4):
+                          A=np.column_stack([x[keep],np.ones(np.count_nonzero(keep))])
+                          gain,bias=np.linalg.lstsq(A,y[keep],rcond=None)[0]
+                          res=y-(gain*x+bias)
+                          med=np.median(res); mad=np.median(np.abs(res-med))+1e-6
+                          keep=np.abs(res-med)<3.5*1.4826*mad
+                      if not (0.88<=gain<=1.12 and -15<=bias<=15):
+                          fit_ok=False
+                          gain=1.0; bias=0.0
+                  matched[:,:,ch]=np.clip(donor_f[:,:,ch]*gain+bias,0,255)
+                  fits.append({"gain":float(gain),"bias":float(bias)})
+
+              matched=matched.astype(np.uint8)
+              a3=alpha[:,:,None]
+              restored=np.clip(hd_f*(1-a3)+matched.astype(np.float32)*a3,0,255).astype(np.uint8)
+
+              # Edge/seam metric only in a thin band around the shaped mask.
+              boundary=(cv2.dilate(full_binary,np.ones((7,7),np.uint8),1)>0) & (cv2.erode(full_binary,np.ones((7,7),np.uint8),1)==0)
+              def grad_mean(img):
+                  g=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY).astype(np.float32)
+                  gx=cv2.Sobel(g,cv2.CV_32F,1,0,ksize=3)
+                  gy=cv2.Sobel(g,cv2.CV_32F,0,1,ksize=3)
+                  mag=cv2.magnitude(gx,gy)
+                  return float(np.mean(mag[boundary])),float(np.median(mag[boundary]))
+              gm0=grad_mean(hd); gm1=grad_mean(restored)
+
+              restored_full=hd_full.copy()
+              restored_full[4:1076,10:1914]=restored
+              donor_full=hd_full.copy()
+              donor_full[4:1076,10:1914]=donor
+
+              fx0,fy0,fx1,fy1=180,894,394,986
+              pad=45
+              X0=max(0,fx0-pad); Y0=max(0,fy0-pad); X1=min(1920,fx1+pad); Y1=min(1080,fy1+pad)
+              crop_o=hd_full[Y0:Y1,X0:X1]
+              crop_d=donor_full[Y0:Y1,X0:X1]
+              crop_r=restored_full[Y0:Y1,X0:X1]
+
+              # Visualize mask as a fourth panel.
+              mask_vis=np.zeros_like(crop_o)
+              am=(alpha[max(0,Y0-4):min(1072,Y1-4),max(0,X0-10):min(1904,X1-10)]*255).astype(np.uint8)
+              if am.shape[:2]==mask_vis.shape[:2]:
+                  mask_vis[:,:,0]=am; mask_vis[:,:,1]=am; mask_vis[:,:,2]=am
+              contact=np.hstack([crop_o,crop_d,crop_r,mask_vis])
+              cv2.imwrite(f"prototype/{tag}-logo-shaped-comparison.png",contact)
+
+              outputs.append({
+                  "tag":tag,
+                  "registration":meta[tag],
+                  "photometric_fit_ok":fit_ok,
+                  "photometric_fit":fits,
+                  "boundary_gradient_mean_original":gm0[0],
+                  "boundary_gradient_mean_restored":gm1[0],
+                  "boundary_gradient_median_original":gm0[1],
+                  "boundary_gradient_median_restored":gm1[1],
+              })
+
+          cv2.imwrite("prototype/logo-alpha.png",(alpha*255).astype(np.uint8))
+          print("=== LOGO SHAPED PROTOTYPE JSON ===")
+          print(json.dumps({
+              "valid_registration_tags":sorted(registered.keys()),
+              "rejected_registration_tags":[t for t in tags if t not in registered],
+              "mask_seed_threshold":threshold,
+              "mask_pixels_alpha_gt_001":changed,
+              "mask_pixels_alpha_gt_05":strong,
+              "frame_pixels":1920*1080,
+              "fraction_frame_alpha_gt_001":changed/(1920*1080),
+              "fraction_frame_alpha_gt_05":strong/(1920*1080),
+              "comparison_columns":["original_1080p","registered_DVD_donor","logo_shaped_restoration","alpha_mask"],
+              "results":outputs,
+          },indent=2))
+          PY
+
+      - name: Upload logo-shaped comparisons
+        uses: actions/upload-artifact@v4
+        with:
+          name: episode-01-logo-shaped-prototype
+          path: prototype/*.png
+          if-no-files-found: error

@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "source_roots": {
+    "dvd": "/downloads/S60/DVD",
+    "1080p": "/downloads/S60/1080p"
+  },
+  "notes": [
+    "DVD is the clean no-network-bug reference source.",
+    "1080p is the highest-resolution source and contains the network bug.",
+    "Episode pairing was verified one-to-one by filename episode numbering.",
+    "The DVD making-of documentary is intentionally excluded."
+  ],
+  "episodes": [
+    {
+      "episode": 1,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 01 - Pilot.avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E01.mp4"
+    },
+    {
+      "episode": 2,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 02 - The Cold Open.avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E02.mp4"
+    },
+    {
+      "episode": 3,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 03 - The Focus Group.avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E03.mp4"
+    },
+    {
+      "episode": 4,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 04 - The West Coast Delay.avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E04.mp4"
+    },
+    {
+      "episode": 5,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 05 - The Long Lead Story.avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E05.mp4"
+    },
+    {
+      "episode": 6,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 06 - The Wrap Party.avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E06.mp4"
+    },
+    {
+      "episode": 7,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 07 - Nevada Day (Part 1).avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E07.mp4"
+    },
+    {
+      "episode": 8,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 08 - Nevada Day (Part 2).avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E08.mp4"
+    },
+    {
+      "episode": 9,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 09 - The Option Period.avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E09.mp4"
+    },
+    {
+      "episode": 10,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 10 - B-12.avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E10.mp4"
+    },
+    {
+      "episode": 11,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 11 - The Christmas Show.avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E11.mp4"
+    },
+    {
+      "episode": 12,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 12 - Monday.avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E12.mp4"
+    },
+    {
+      "episode": 13,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 13 - The Harriet Dinner (part 1).avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E13.mp4"
+    },
+    {
+      "episode": 14,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 14 - The Harriet Dinner (part 2).avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E14.mp4"
+    },
+    {
+      "episode": 15,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 15 - The Friday Night Slaughter.avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E15.mp4"
+    },
+    {
+      "episode": 16,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 16 - 4 AM Miracle.avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E16.mp4"
+    },
+    {
+      "episode": 17,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 17 - The Disaster Show.avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E17.mp4"
+    },
+    {
+      "episode": 18,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 18 - Breaking News.avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E18.mp4"
+    },
+    {
+      "episode": 19,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 19 - K and R (Part 1).avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E19.mp4"
+    },
+    {
+      "episode": 20,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 20 - K and R (Part 2).avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E20.mp4"
+    },
+    {
+      "episode": 21,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 21 - K and R (Part 3).avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E21.mp4"
+    },
+    {
+      "episode": 22,
+      "dvd": "/downloads/S60/DVD/Studio 60 - 22 - What Kind of Day Has It Been.avi",
+      "1080p": "/downloads/S60/1080p/Studio 60 S01E22.mp4"
+    }
+  ]
+}

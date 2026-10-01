@@ -48,19 +48,29 @@ jobs:
       - name: Extract matched still pairs
         shell: bash
         run: |
-          # hd_time dvd_time, chosen from stable timing plateaus
-          while read hd dvd; do
-            tag=$(printf "%04d" "$hd")
-            ffmpeg -v error -ss "$dvd" -i dvd.avi -frames:v 1 "dvd-$tag.png"
-            ffmpeg -v error -ss "$hd"  -i hd.mp4  -frames:v 1 "hd-$tag.png"
-          done <<'EOF'
-          300 301.93
-          900 899.56
-          1500 1499.40
-          1800 1801.17
-          2200 2200.59
-          2500 2500.59
-          EOF
+          python3 - <<'PY'
+          import subprocess
+
+          pairs=[
+              (300,301.93),
+              (900,899.56),
+              (1500,1499.40),
+              (1800,1801.17),
+              (2200,2200.59),
+              (2500,2500.59),
+          ]
+          for hd,dvd in pairs:
+              tag=f"{hd:04d}"
+              subprocess.run([
+                  "ffmpeg","-v","error","-ss",str(dvd),"-i","dvd.avi",
+                  "-frames:v","1",f"dvd-{tag}.png"
+              ],check=True)
+              subprocess.run([
+                  "ffmpeg","-v","error","-ss",str(hd),"-i","hd.mp4",
+                  "-frames:v","1",f"hd-{tag}.png"
+              ],check=True)
+              print(f"Extracted matched pair {tag}: HD {hd:.2f}s / DVD {dvd:.2f}s")
+          PY
 
       - name: Localize persistent unexplained difference
         shell: bash

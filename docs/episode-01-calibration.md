@@ -42,3 +42,28 @@ Cropdetect also indicates small edge differences between the encodes. Registrati
 ## Restoration principle
 
 Treat 1080p as the master image everywhere it is unobscured. The DVD is a clean reference for reconstruction of the network-bug region, after temporal and spatial registration. Avoid replacing larger 1080p areas with DVD-derived pixels than necessary.
+
+
+## Local audio alignment findings
+
+A 1 kHz mono audio-envelope cross-correlation was run at five anchors, using the 1080p source as the time reference.
+
+| 1080p anchor | Best DVD - 1080p offset | Correlation |
+| ---: | ---: | ---: |
+| 300 s | +1.930 s | 0.674 |
+| 900 s | -0.440 s | 0.915 |
+| 1500 s | -0.600 s | 0.964 |
+| 2100 s | +0.590 s | 0.860 |
+| 2550 s | +0.590 s | 1.006 |
+
+The offset changes sign and later jumps again. This is incompatible with one fixed global offset and does not look like smooth clock drift. The working model is a small number of discrete edit/timeline discontinuities. Production registration should therefore use a piecewise time map.
+
+## DVD cadence finding
+
+A 12-second DVD sample at 300 s was decoded at native cadence and adjacent-frame mean absolute differences were grouped by transition index modulo 5. One modulo class had a mean MAD of only 0.130, while the other four classes were roughly 8.2–8.9. The lowest-difference transitions overwhelmingly occurred every fifth frame.
+
+This is strong evidence that the DVD's 29.97 fps stream represents 23.976-origin material by repeating one frame in each five-frame cycle. A deterministic duplicate-frame decimation can therefore recover a 23.976-like clean reference before spatial registration. The exact phase should be verified per episode and around edit discontinuities rather than assumed globally.
+
+## Next calibration step
+
+Run a denser audio-offset map across episode 1 to locate the discontinuity boundaries. Once the piecewise time map is known, compare registered picture samples to solve scale/crop/translation and then characterize the network-bug footprint itself.

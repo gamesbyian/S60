@@ -1,0 +1,157 @@
+name: Source pairing manifest
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/source-pairing.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  pair-sources:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      FTP_HOST: wood.seedhost.eu
+      FTP_USER: ianseeds
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+
+    steps:
+      - name: Pair DVD and 1080p episodes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib
+          import json
+          import os
+          import re
+          import sys
+          from collections import defaultdict, deque
+
+          host = os.environ["FTP_HOST"]
+          user = os.environ["FTP_USER"]
+          password = os.environ.get("FTP_PASSWORD", "")
+          if not password:
+              print("ERROR: FTP_PASSWORD secret is not available.", file=sys.stderr)
+              sys.exit(2)
+
+          ftp = ftplib.FTP()
+          ftp.connect(host, 21, timeout=30)
+          ftp.login(user, password)
+
+          ROOTS = {
+              "dvd": "/downloads/S60/DVD",
+              "1080p": "/downloads/S60/1080p",
+          }
+
+          def list_entries(path):
+              ftp.cwd(path)
+              try:
+                  entries = list(ftp.mlsd())
+                  return [(name, facts.get("type", "?")) for name, facts in entries if name not in (".", "..")]
+              except Exception:
+                  out = []
+                  for name in ftp.nlst():
+                      try:
+                          ftp.cwd(path + "/" + name)
+                          ftp.cwd(path)
+                          kind = "dir"
+                      except Exception:
+                          kind = "file"
+                      out.append((name, kind))
+                  return out
+
+          def collect_files(root, max_dirs=200):
+              files = []
+              q = deque([root])
+              seen = 0
+              while q:
+                  path = q.popleft()
+                  seen += 1
+                  if seen > max_dirs:
+                      raise RuntimeError(f"directory bound exceeded under {root}")
+                  for name, kind in list_entries(path):
+                      full = path.rstrip("/") + "/" + name
+                      if kind == "dir":
+                          q.append(full)
+                      elif kind == "file":
+                          files.append(full)
+              return sorted(files, key=str.lower)
+
+          # Conservative parsers, from strongest to weakest.
+          patterns = [
+              re.compile(r"(?i)\bS(?:eason)?\s*0?1[ ._-]*E(?:p(?:isode)?)?\s*0?(\d{1,2})\b"),
+              re.compile(r"(?i)\b0?1\s*[xX]\s*0?(\d{1,2})\b"),
+              re.compile(r"(?i)\bE(?:p(?:isode)?)?\s*0?(\d{1,2})\b"),
+              re.compile(r"(?i)\bEpisode[ ._-]*0?(\d{1,2})\b"),
+          ]
+
+          def episode_number(path):
+              base = path.rsplit("/", 1)[-1]
+              for rx in patterns:
+                  m = rx.search(base)
+                  if m:
+                      n = int(m.group(1))
+                      if 1 <= n <= 99:
+                          return n, rx.pattern
+              return None, None
+
+          all_files = {kind: collect_files(root) for kind, root in ROOTS.items()}
+          parsed = {}
+          unparsed = {}
+          for kind, files in all_files.items():
+              by_ep = defaultdict(list)
+              misses = []
+              for path in files:
+                  ep, parser = episode_number(path)
+                  if ep is None:
+                      misses.append(path)
+                  else:
+                      by_ep[ep].append({"path": path, "parser": parser})
+              parsed[kind] = by_ep
+              unparsed[kind] = misses
+
+          episode_ids = sorted(set(parsed["dvd"]) | set(parsed["1080p"]))
+          manifest = []
+          issues = []
+          for ep in episode_ids:
+              dvd = parsed["dvd"].get(ep, [])
+              hd = parsed["1080p"].get(ep, [])
+              status = "paired" if len(dvd) == 1 and len(hd) == 1 else "ambiguous"
+              row = {
+                  "episode": ep,
+                  "status": status,
+                  "dvd": [x["path"] for x in dvd],
+                  "1080p": [x["path"] for x in hd],
+              }
+              manifest.append(row)
+              if status != "paired":
+                  issues.append(row)
+
+          summary = {
+              "file_counts": {k: len(v) for k, v in all_files.items()},
+              "parsed_episode_counts": {k: len(v) for k, v in parsed.items()},
+              "unparsed_counts": {k: len(v) for k, v in unparsed.items()},
+              "paired_count": sum(1 for x in manifest if x["status"] == "paired"),
+              "issue_count": len(issues),
+          }
+
+          print("=== SOURCE PAIRING SUMMARY ===")
+          print(json.dumps(summary, indent=2))
+          print("")
+          print("=== SOURCE PAIRING MANIFEST JSON ===")
+          print(json.dumps(manifest, indent=2))
+          print("")
+          print("=== UNPARSED FILES JSON ===")
+          print(json.dumps(unparsed, indent=2))
+
+          try:
+              ftp.quit()
+          except Exception:
+              ftp.close()
+
+          if issues:
+              print(f"WARNING: {len(issues)} episode IDs are not one-to-one pairs.", file=sys.stderr)
+          PY

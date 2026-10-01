@@ -67,3 +67,19 @@ This is strong evidence that the DVD's 29.97 fps stream represents 23.976-origin
 ## Next calibration step
 
 Run a denser audio-offset map across episode 1 to locate the discontinuity boundaries. Once the piecewise time map is known, compare registered picture samples to solve scale/crop/translation and then characterize the network-bug footprint itself.
+
+
+## Dense timing map
+
+A denser 60-second audio-envelope correlation pass confirms stable timing plateaus rather than continuous drift:
+
+| 1080p anchor range | DVD - 1080p offset |
+| --- | ---: |
+| 120–540 s | +1.930 s |
+| 600–1140 s | -0.440 s |
+| 1200–1620 s | -0.600 s |
+| ~1680 s | +0.540 s transitional point |
+| 1740–1980 s | +1.170 s |
+| 2040–2640 s | +0.590 s |
+
+Correlation scores across these anchors were generally strong. The working model is therefore several discrete edit/timing changes. The next pass should localize each boundary more precisely, then solve spatial registration within each stable segment.

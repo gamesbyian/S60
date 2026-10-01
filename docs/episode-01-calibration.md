@@ -117,3 +117,20 @@ After that coarse resize, robust feature matching and RANSAC estimated a small r
 - Mean absolute luma difference outside the masked bug zone: 12.616
 
 This indicates that the DVD and 1080p pictures are geometrically very close after active-picture normalization. A lightweight affine registration is likely sufficient within stable timeline segments. The low median residual is promising for using DVD-derived content only inside the bug mask, while retaining native 1080p pixels everywhere else.
+
+
+## Focused network-bug mask result
+
+A six-sample persistent-difference pass, restricted to the lower-left candidate region and using a percentile threshold robust to zero-inflated residuals, isolated one dominant component.
+
+- Active-picture component: x=182, y=902, w=190, h=68
+- Conservative active-picture bounding box: x=170..384, y=890..982
+- Conservative full-frame 1080p bounding box: x=180..394, y=894..986
+- Full-frame box size: 214×92 pixels
+- Fraction of a 1920×1080 frame: about 0.95%
+
+This is small enough to support the preservation-first strategy: native 1080p pixels can remain untouched across more than 99% of each affected frame.
+
+Registration quality varied by sample. The 1500 s sample produced an implausible affine transform with only 19 inliers and must be rejected by production quality gates. Other samples produced plausible transforms with substantially more inliers. Restoration code must therefore validate transform scale/rotation/translation/inlier support and fall back or re-estimate rather than applying every estimated transform blindly.
+
+Patch-region residuals before restoration were much larger than many seam-ring residuals, supporting the interpretation that the isolated region contains a real persistent overlay rather than merely global encode mismatch.

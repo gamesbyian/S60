@@ -1,0 +1,91 @@
+name: Source characterization
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/source-characterization.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  characterize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FTP_HOST: wood.seedhost.eu
+      FTP_USER: ianseeds
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+
+    steps:
+      - name: Download episode 1 reference pair
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib, os, pathlib
+          host=os.environ["FTP_HOST"]; user=os.environ["FTP_USER"]; password=os.environ["FTP_PASSWORD"]
+          files={
+            "dvd.avi":"/downloads/S60/DVD/Studio 60 - 01 - Pilot.avi",
+            "hd.mp4":"/downloads/S60/1080p/Studio 60 S01E01.mp4",
+          }
+          ftp=ftplib.FTP()
+          ftp.connect(host,21,timeout=30)
+          ftp.login(user,password)
+          for local,remote in files.items():
+              size=ftp.size(remote)
+              print(f"Downloading {remote} ({size:,} bytes)")
+              with open(local,"wb") as fh:
+                  ftp.retrbinary("RETR "+remote, fh.write, blocksize=1024*1024)
+              print(f"Downloaded {local}: {pathlib.Path(local).stat().st_size:,} bytes")
+          ftp.quit()
+          PY
+
+      - name: Probe media metadata
+        shell: bash
+        run: |
+          echo "=== DVD FFPROBE ==="
+          ffprobe -v error -show_format -show_streams -of json dvd.avi
+          echo "=== 1080P FFPROBE ==="
+          ffprobe -v error -show_format -show_streams -of json hd.mp4
+
+      - name: Probe frame cadence and crop
+        shell: bash
+        run: |
+          echo "=== DVD FRAME RATE / DIMENSIONS ==="
+          ffprobe -v error -select_streams v:0 -count_frames             -show_entries stream=width,height,pix_fmt,sample_aspect_ratio,display_aspect_ratio,r_frame_rate,avg_frame_rate,time_base,duration,nb_frames,nb_read_frames             -of default=nw=1 dvd.avi
+          echo "=== 1080P FRAME RATE / DIMENSIONS ==="
+          ffprobe -v error -select_streams v:0 -count_frames             -show_entries stream=width,height,pix_fmt,sample_aspect_ratio,display_aspect_ratio,r_frame_rate,avg_frame_rate,time_base,duration,nb_frames,nb_read_frames             -of default=nw=1 hd.mp4
+
+          echo "=== DVD CROPDETECT samples ==="
+          for t in 60 600 1200 1800; do
+            echo "--- t=$t ---"
+            ffmpeg -hide_banner -ss "$t" -i dvd.avi -t 8 -vf cropdetect=24:16:0 -an -f null - 2>&1 | grep -o 'crop=[0-9:]*' | tail -n 3 || true
+          done
+          echo "=== 1080P CROPDETECT samples ==="
+          for t in 60 600 1200 1800; do
+            echo "--- t=$t ---"
+            ffmpeg -hide_banner -ss "$t" -i hd.mp4 -t 8 -vf cropdetect=24:16:0 -an -f null - 2>&1 | grep -o 'crop=[0-9:]*' | tail -n 3 || true
+          done
+
+      - name: Generate coarse visual fingerprints
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import subprocess, hashlib, json
+
+          times=[60,300,600,900,1200,1500,1800,2100]
+          files={"dvd":"dvd.avi","1080p":"hd.mp4"}
+          out={}
+          for label,path in files.items():
+              out[label]=[]
+              for t in times:
+                  p=subprocess.run([
+                    "ffmpeg","-v","error","-ss",str(t),"-i",path,
+                    "-frames:v","1","-vf","scale=64:36:flags=area,format=gray",
+                    "-f","rawvideo","-"
+                  ],stdout=subprocess.PIPE,check=True)
+                  out[label].append({"t":t,"sha256":hashlib.sha256(p.stdout).hexdigest(),"bytes":len(p.stdout)})
+          print("=== COARSE FRAME HASHES ===")
+          print(json.dumps(out,indent=2))
+          PY

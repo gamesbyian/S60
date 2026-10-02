@@ -101,20 +101,23 @@ jobs:
               hs=sorted(os.listdir(hf)); ds=sorted(os.listdir(df))
               n=min(len(hs),len(ds))
 
-              raw=[None]*n
+              # Load active frames once. A nominal one-to-one pairing can
+              # still be off by a frame after an edit because inverse cadence
+              # phase may reset. We therefore allow a tiny donor-frame search.
+              hactive=[]
+              dactive=[]
               hd_gray=[]
-              for i in range(n):
-                  hfull=cv2.imread(f"{hf}/{hs[i]}")
-                  dfull=cv2.imread(f"{df}/{ds[i]}")
-                  hd=active_hd(hfull)
-                  dvd=active_dvd(dfull)
-                  hd_gray.append(cv2.resize(cv2.cvtColor(hd,cv2.COLOR_BGR2GRAY),(96,54),interpolation=cv2.INTER_AREA))
-                  up=cv2.resize(dvd,(hd.shape[1],hd.shape[0]),interpolation=cv2.INTER_LANCZOS4)
-                  M,m=register(up,hd)
-                  if M is not None and m["ok"]:
-                      raw[i]=m
+              dvd_gray=[]
+              for p in hs[:n]:
+                  h=active_hd(cv2.imread(f"{hf}/{p}"))
+                  hactive.append(h)
+                  hd_gray.append(cv2.resize(cv2.cvtColor(h,cv2.COLOR_BGR2GRAY),(96,54),interpolation=cv2.INTER_AREA))
+              for p in ds:
+                  d=active_dvd(cv2.imread(f"{df}/{p}"))
+                  dactive.append(d)
+                  dvd_gray.append(cv2.resize(cv2.cvtColor(d,cv2.COLOR_BGR2GRAY),(96,54),interpolation=cv2.INTER_AREA))
 
-              # Detect hard scene cuts from HD itself. Registration fallback is
+              # Detect hard scene cuts from HD first.
               # never allowed to bridge a cut.
               cuts=[0]
               cut_scores=[]
@@ -125,6 +128,42 @@ jobs:
                       cuts.append(i)
               cuts.append(n)
               cuts=sorted(set(cuts))
+
+              # Solve one small temporal phase offset per HD shot. Compare
+              # low-resolution luminance over several interior frames and test
+              # DVD shifts of ±3 source frames. This is not optical flow or
+              # retiming; it only chooses the correct cadence-normalized donor
+              # frame at an edit boundary.
+              shot_offsets={}
+              raw=[None]*n
+              raw_donor_index=[None]*n
+              for si in range(len(cuts)-1):
+                  lo,hi=cuts[si],cuts[si+1]
+                  probes=list(range(lo,min(hi,lo+18),max(1,(min(hi,lo+18)-lo)//5 or 1)))
+                  best_shift=0; best_score=float("inf")
+                  for sh in range(-3,4):
+                      vals=[]
+                      for i in probes:
+                          j=i+sh
+                          if 0<=j<len(dvd_gray):
+                              vals.append(float(np.mean(np.abs(hd_gray[i].astype(np.float32)-dvd_gray[j].astype(np.float32)))))
+                      if vals:
+                          score=float(np.median(vals))
+                          if score<best_score:
+                              best_score=score; best_shift=sh
+                  shot_offsets[str(si)]={"start":lo,"end":hi,"dvd_shift":best_shift,"probe_mad":best_score}
+
+                  for i in range(lo,hi):
+                      j=i+best_shift
+                      if not (0<=j<len(dactive)):
+                          continue
+                      hd=hactive[i]
+                      dvd=dactive[j]
+                      up=cv2.resize(dvd,(hd.shape[1],hd.shape[0]),interpolation=cv2.INTER_LANCZOS4)
+                      M,m=register(up,hd)
+                      if M is not None and m["ok"]:
+                          raw[i]=m
+                          raw_donor_index[i]=j
 
               recovered=[None]*n
               source=["reject"]*n
@@ -173,6 +212,7 @@ jobs:
                   "frames":n,
                   "scene_count":max(0,len(cuts)-1),
                   "cut_frames":cuts[1:-1],
+                  "shot_temporal_offsets":shot_offsets,
                   "raw_accepted":raw_count,
                   "raw_accept_rate":raw_count/max(1,n),
                   "recovered_frames":rec_count,

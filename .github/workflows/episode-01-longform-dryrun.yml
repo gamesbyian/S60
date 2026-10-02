@@ -128,42 +128,44 @@ jobs:
 
               recovered=[None]*n
               source=["reject"]*n
-              max_gap=24  # one second at 23.976
 
               for si in range(len(cuts)-1):
                   lo,hi=cuts[si],cuts[si+1]
                   valid=[i for i in range(lo,hi) if raw[i] is not None]
                   if not valid:
                       continue
+
+                  # A shot-level robust transform is the primary fallback.
+                  # Mapping between the DVD and HD sources should be geometrically
+                  # coherent within one edit shot; low-feature frames do not need
+                  # to solve their own affine from scratch.
+                  shot_vals={}
+                  for k in ["scale","rot","tx","ty"]:
+                      arr=np.array([raw[i][k] for i in valid],dtype=np.float64)
+                      med=float(np.median(arr))
+                      mad=float(np.median(np.abs(arr-med)))+1e-9
+                      keep=np.abs(arr-med)<=max(0.002 if k=="scale" else 0.25 if k=="rot" else 4.0, 3.5*1.4826*mad)
+                      shot_vals[k]=float(np.median(arr[keep])) if np.any(keep) else med
+                  shot_vals["inliers"]=int(np.median([raw[i]["inliers"] for i in valid]))
+                  shot_vals["ok"]=True
+
+                  # Require at least a little direct evidence. One isolated raw
+                  # solution is not enough to define an entire long shot.
+                  shot_supported=len(valid)>=3 or (hi-lo)<=12
+
                   for i in range(lo,hi):
                       if raw[i] is not None:
                           recovered[i]=raw[i]
                           source[i]="raw"
-                          continue
-                      left=max([j for j in valid if j<i],default=None)
-                      right=min([j for j in valid if j>i],default=None)
-
-                      # Linear interpolation only when both anchors are nearby
-                      # and inside the same shot. Otherwise one-sided carry for
-                      # a very short gap. Long unsupported spans stay rejected.
-                      if left is not None and right is not None and i-left<=max_gap and right-i<=max_gap:
-                          t=(i-left)/(right-left)
-                          r={}
-                          for k in ["scale","rot","tx","ty"]:
-                              r[k]=float(raw[left][k]*(1-t)+raw[right][k]*t)
-                          r["inliers"]=int(min(raw[left]["inliers"],raw[right]["inliers"]))
-                          r["ok"]=True
-                          recovered[i]=r
-                          source[i]="interp"
-                      elif left is not None and i-left<=6:
-                          recovered[i]=dict(raw[left]); source[i]="carry-left"
-                      elif right is not None and right-i<=6:
-                          recovered[i]=dict(raw[right]); source[i]="carry-right"
+                      elif shot_supported:
+                          recovered[i]=dict(shot_vals)
+                          source[i]="shot-median"
 
               raw_count=sum(x is not None for x in raw)
               rec_count=sum(x is not None for x in recovered)
               unresolved=[i for i,x in enumerate(recovered) if x is None]
               fallback=sum(1 for s in source if s not in ("raw","reject"))
+              shot_median_frames=sum(1 for s in source if s=="shot-median")
 
               vals={k:[x[k] for x in recovered if x is not None] for k in ["scale","rot","tx","ty","inliers"]}
               summary={
@@ -176,6 +178,7 @@ jobs:
                   "recovered_frames":rec_count,
                   "recovered_accept_rate":rec_count/max(1,n),
                   "fallback_frames":fallback,
+                  "shot_median_frames":shot_median_frames,
                   "unresolved_frames":len(unresolved),
                   "sample_unresolved":unresolved[:20],
                   "median":{

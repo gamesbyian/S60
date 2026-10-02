@@ -57,8 +57,22 @@ jobs:
           # Non-neural control. Match gross HD active-picture geometry.
           ffmpeg -v error -i dvd90-active.mkv -t 90             -vf "scale=1904:1072:flags=lanczos,pad=1920:1080:10:4:black"             -c:v libx264 -crf 10 -preset slow -pix_fmt yuv420p             -an lanczos.mp4
 
-          # Basic sanity.
-          ffprobe -v error -count_frames -select_streams v:0             -show_entries stream=width,height,avg_frame_rate,nb_read_frames             -of json dvd90-active.mkv hd-reference.mp4 lanczos.mp4 > prep-probe.json
+          # Basic sanity. ffprobe accepts one input per invocation.
+          python3 - <<'PY'
+          import json, subprocess
+          files=["dvd90-active.mkv","hd-reference.mp4","lanczos.mp4"]
+          out={}
+          for p in files:
+              raw=subprocess.check_output([
+                  "ffprobe","-v","error","-count_frames","-select_streams","v:0",
+                  "-show_entries","stream=width,height,avg_frame_rate,nb_read_frames",
+                  "-of","json",p
+              ],text=True)
+              out[p]=json.loads(raw)
+          with open("prep-probe.json","w") as fh:
+              json.dump(out,fh,indent=2)
+          print(json.dumps(out,indent=2))
+          PY
 
       - name: Upload prepared source artifact
         uses: actions/upload-artifact@v4

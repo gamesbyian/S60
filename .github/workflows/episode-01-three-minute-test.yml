@@ -203,6 +203,7 @@ jobs:
               shot_for[p["start"]:p["end"]]=si
 
           temporal_delta=[]
+          local_offsets=[]
           prev_roi=None
           for i in range(n):
               p=shot_plan[int(shot_for[i])]
@@ -215,10 +216,39 @@ jobs:
               up=cv2.resize(d,(h.shape[1],h.shape[0]),interpolation=cv2.INTER_LANCZOS4)
               donor=cv2.warpAffine(up,p["M"],(h.shape[1],h.shape[0]),flags=cv2.INTER_LANCZOS4)
 
-              # Robust local donor-to-HD tone fit. Measure only in a narrow ring
-              # surrounding the logo, exclude the logo itself, clamp aggressively,
-              # and apply the correction only to donor pixels under the alpha.
+              # Refine registration locally around the repair. Whole-frame affine
+              # metrics can be excellent while leaving a few-pixel residual in
+              # this corner, which turns the clean donor itself into a logo-shaped
+              # ghost after compositing. Search only translation ±6 px and score
+              # a surrounding ring that excludes the logo.
               binmask=(alpha>0.01).astype(np.uint8)
+              outer=cv2.dilate(binmask,np.ones((35,35),np.uint8),iterations=1).astype(bool)
+              inner=cv2.dilate(binmask,np.ones((5,5),np.uint8),iterations=1).astype(bool)
+              ring=outer & (~inner)
+              ring_y,ring_x=np.where(ring)
+              local_dx=local_dy=0
+              best_local=float("inf")
+              hg=cv2.cvtColor(h,cv2.COLOR_BGR2GRAY).astype(np.float32)
+              dg0=cv2.cvtColor(donor,cv2.COLOR_BGR2GRAY).astype(np.float32)
+              for dy in range(-6,7):
+                  for dx in range(-6,7):
+                      yy=ring_y+dy; xx=ring_x+dx
+                      valid=(yy>=0)&(yy<dg0.shape[0])&(xx>=0)&(xx<dg0.shape[1])
+                      if np.count_nonzero(valid)<300:
+                          continue
+                      diff=np.abs(hg[ring_y[valid],ring_x[valid]]-dg0[yy[valid],xx[valid]])
+                      score=float(np.median(diff))
+                      if score<best_local:
+                          best_local=score; local_dx=dx; local_dy=dy
+              local_offsets.append([int(local_dx),int(local_dy),float(best_local)])
+              if local_dx or local_dy:
+                  T=np.array([[1,0,-local_dx],[0,1,-local_dy]],dtype=np.float32)
+                  donor=cv2.warpAffine(donor,T,(h.shape[1],h.shape[0]),flags=cv2.INTER_LANCZOS4,
+                                       borderMode=cv2.BORDER_REPLICATE)
+
+              # Robust local donor-to-HD tone fit after local residual alignment.
+              # Measure only in a narrow ring surrounding the logo, exclude the
+              # logo itself, clamp aggressively, and apply only beneath alpha.
               outer=cv2.dilate(binmask,np.ones((17,17),np.uint8),iterations=1).astype(bool)
               inner=cv2.dilate(binmask,np.ones((3,3),np.uint8),iterations=1).astype(bool)
               ring=outer & (~inner)
@@ -264,6 +294,10 @@ jobs:
               "shot_probe_mad_p95":float(np.percentile([p["probe_mad"] for p in shot_plan],95)),
               "temporal_roi_delta_mean":float(np.mean(temporal_delta)),
               "temporal_roi_delta_p95":float(np.percentile(temporal_delta,95)),
+              "local_offset_dx_median":float(np.median([v[0] for v in local_offsets])),
+              "local_offset_dy_median":float(np.median([v[1] for v in local_offsets])),
+              "local_offset_abs_p95":float(np.percentile([abs(v[0])+abs(v[1]) for v in local_offsets],95)),
+              "local_ring_mad_median":float(np.median([v[2] for v in local_offsets])),
               "shot_plan":[{
                   "start":p["start"],"end":p["end"],"shift":p["shift"],
                   "probe_mad":p["probe_mad"],"anchors":p["anchors"],"params":p["params"]

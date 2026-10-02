@@ -142,11 +142,15 @@ jobs:
 
           case "$METHOD" in
             realesrgan)
-              "$BIN" -i input -o output -n realesrgan-x4plus -s 4 -f png -j 2:2:2
+              # Conservative live-action/DVD pass: use the general scene model
+              # at 2x rather than hallucinating a full 4x reconstruction, then
+              # normalize to exact HD geometry in the shared ffmpeg step.
+              "$BIN" -i input -o output -n realesr-general-x4v3 -s 2 -f png -j 2:2:2
               ;;
             realsr)
               MODELS=$(find tool -type d -name 'models-DF2K' | head -1)
-              "$BIN" -i input -o output -s 4 -m "$MODELS" -f png -j 2:2:2
+              # RealSR's own reference example enables TTA for quality.
+              "$BIN" -i input -o output -s 4 -x -m "$MODELS" -f png -j 2:2:2
               ;;
             srmd)
               MODELS=$(find tool -type d -name 'models-srmd' | head -1)

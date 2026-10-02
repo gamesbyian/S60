@@ -1,0 +1,418 @@
+name: Episode 1 90-second upscale recovery
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/episode-01-90s-upscale-recovery.yml"
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  SOURCE_RUN_ID: "36959736404"
+
+jobs:
+  srmd-missing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 3, 5]
+    steps:
+      - name: Download preserved prepared source
+        uses: actions/download-artifact@v4
+        with:
+          name: upscale-screening-prep
+          path: prep
+          repository: gamesbyian/S60
+          run-id: 36959736404
+          github-token: ${{ github.token }}
+
+      - name: Install runtime
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg unzip wget mesa-vulkan-drivers
+          if [ -f /usr/share/vulkan/icd.d/lvp_icd.x86_64.json ]; then
+            echo "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install SRMD
+        run: |
+          wget -q https://github.com/nihui/srmd-ncnn-vulkan/releases/download/20220728/srmd-ncnn-vulkan-20220728-ubuntu.zip -O tool.zip
+          unzip -q tool.zip -d tool
+          chmod +x $(find tool -type f -name '*ncnn-vulkan*' | head -1)
+
+      - name: Rebuild only missing SRMD shard
+        env:
+          SHARD: ${{ matrix.shard }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir input output
+          START=$((SHARD * 15))
+          ffmpeg -v error -ss "$START" -i prep/dvd90-active.mkv -t 15 -vsync 0 input/%06d.png
+          BIN=$(find tool -type f -name '*ncnn-vulkan*' | head -1)
+          MODELS=$(find tool -type d -name 'models-srmd' | head -1)
+          T0=$(date +%s)
+          "$BIN" -i input -o output -s 4 -n -1 -m "$MODELS" -f png -j 2:2:2
+          T1=$(date +%s)
+          COUNT=$(find output -name '*.png' | wc -l)
+          test "$COUNT" -eq 360
+          ffmpeg -v error -framerate 24000/1001 -i output/%06d.png             -vf "scale=1904:1072:flags=lanczos,pad=1920:1080:10:4:black"             -c:v libx264 -crf 10 -preset slow -pix_fmt yuv420p -an "chunk-${SHARD}.mp4"
+          ffmpeg -v error -ss 5 -i "chunk-${SHARD}.mp4" -frames:v 1 check.png
+          MEAN=$(ffmpeg -v error -i check.png -vf signalstats,metadata=print:file=- -f null - 2>&1 | awk -F= '/lavfi.signalstats.YAVG/{print $2; exit}')
+          python3 - "$MEAN" <<'PY'
+          import sys
+          v=float(sys.argv[1] or 0)
+          if v < 4:
+              raise SystemExit("output sanity failure: near-black frame")
+          PY
+          printf '{"method":"srmd","shard":%s,"seconds":%s,"input_frames":360,"recovered":true}\n'             "$SHARD" "$((T1-T0))" > "runtime-srmd-${SHARD}.json"
+
+      - name: Upload recovered SRMD shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovered-srmd-${{ matrix.shard }}
+          path: |
+            chunk-${{ matrix.shard }}.mp4
+            runtime-srmd-${{ matrix.shard }}.json
+          compression-level: 0
+
+  realesrgan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: 18
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+    steps:
+      - name: Download preserved prepared source
+        uses: actions/download-artifact@v4
+        with:
+          name: upscale-screening-prep
+          path: prep
+          repository: gamesbyian/S60
+          run-id: 36959736404
+          github-token: ${{ github.token }}
+
+      - name: Install runtime and Real-ESRGAN
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg unzip wget mesa-vulkan-drivers
+          if [ -f /usr/share/vulkan/icd.d/lvp_icd.x86_64.json ]; then
+            echo "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json" >> "$GITHUB_ENV"
+          fi
+          wget -q https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip -O tool.zip
+          unzip -q tool.zip -d tool
+          chmod +x tool/realesrgan-ncnn-vulkan
+          test -f tool/models/realesrgan-x4plus.param
+          test -f tool/models/realesrgan-x4plus.bin
+
+      - name: Upscale 5-second shard with bundled live-action model
+        env:
+          SHARD: ${{ matrix.shard }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir input output
+          START=$((SHARD * 5))
+          ffmpeg -v error -ss "$START" -i prep/dvd90-active.mkv -t 5 -vsync 0 input/%06d.png
+          COUNT_IN=$(find input -name '*.png' | wc -l)
+          test "$COUNT_IN" -ge 119
+          T0=$(date +%s)
+          tool/realesrgan-ncnn-vulkan -i input -o output -n realesrgan-x4plus -s 4 -f png -j 2:2:2 2>upscale.log
+          T1=$(date +%s)
+          COUNT_OUT=$(find output -name '*.png' | wc -l)
+          test "$COUNT_OUT" -eq "$COUNT_IN"
+          if grep -qE 'fopen .* failed|find_blob_index_by_name .* failed' upscale.log; then
+            cat upscale.log
+            exit 2
+          fi
+          ffmpeg -v error -framerate 24000/1001 -i output/%06d.png             -vf "scale=1904:1072:flags=lanczos,pad=1920:1080:10:4:black"             -c:v libx264 -crf 10 -preset slow -pix_fmt yuv420p -an "chunk-${SHARD}.mp4"
+          ffmpeg -v error -ss 2 -i "chunk-${SHARD}.mp4" -frames:v 1 check.png
+          MEAN=$(ffmpeg -v error -i check.png -vf signalstats,metadata=print:file=- -f null - 2>&1 | awk -F= '/lavfi.signalstats.YAVG/{print $2; exit}')
+          python3 - "$MEAN" <<'PY'
+          import sys
+          v=float(sys.argv[1] or 0)
+          if v < 4:
+              raise SystemExit("output sanity failure: near-black frame")
+          PY
+          printf '{"method":"realesrgan-x4plus","shard":%s,"seconds":%s,"input_frames":%s}\n'             "$SHARD" "$((T1-T0))" "$COUNT_IN" > "runtime-realesrgan-${SHARD}.json"
+
+      - name: Upload Real-ESRGAN shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovered-realesrgan-${{ matrix.shard }}
+          path: |
+            chunk-${{ matrix.shard }}.mp4
+            runtime-realesrgan-${{ matrix.shard }}.json
+          compression-level: 0
+
+  realsr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: 18
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+    steps:
+      - name: Download preserved prepared source
+        uses: actions/download-artifact@v4
+        with:
+          name: upscale-screening-prep
+          path: prep
+          repository: gamesbyian/S60
+          run-id: 36959736404
+          github-token: ${{ github.token }}
+
+      - name: Install runtime and RealSR
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg unzip wget mesa-vulkan-drivers
+          if [ -f /usr/share/vulkan/icd.d/lvp_icd.x86_64.json ]; then
+            echo "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json" >> "$GITHUB_ENV"
+          fi
+          wget -q https://github.com/nihui/realsr-ncnn-vulkan/releases/download/20220728/realsr-ncnn-vulkan-20220728-ubuntu.zip -O tool.zip
+          unzip -q tool.zip -d tool
+          BIN=$(find tool -type f -name '*ncnn-vulkan*' | head -1)
+          chmod +x "$BIN"
+
+      - name: Upscale 5-second RealSR TTA shard
+        env:
+          SHARD: ${{ matrix.shard }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir input output
+          START=$((SHARD * 5))
+          ffmpeg -v error -ss "$START" -i prep/dvd90-active.mkv -t 5 -vsync 0 input/%06d.png
+          COUNT_IN=$(find input -name '*.png' | wc -l)
+          test "$COUNT_IN" -ge 119
+          BIN=$(find tool -type f -name '*ncnn-vulkan*' | head -1)
+          MODELS=$(find tool -type d -name 'models-DF2K' | head -1)
+          test -n "$MODELS"
+          T0=$(date +%s)
+          "$BIN" -i input -o output -s 4 -x -m "$MODELS" -f png -j 2:2:2
+          T1=$(date +%s)
+          COUNT_OUT=$(find output -name '*.png' | wc -l)
+          test "$COUNT_OUT" -eq "$COUNT_IN"
+          ffmpeg -v error -framerate 24000/1001 -i output/%06d.png             -vf "scale=1904:1072:flags=lanczos,pad=1920:1080:10:4:black"             -c:v libx264 -crf 10 -preset slow -pix_fmt yuv420p -an "chunk-${SHARD}.mp4"
+          ffmpeg -v error -ss 2 -i "chunk-${SHARD}.mp4" -frames:v 1 check.png
+          MEAN=$(ffmpeg -v error -i check.png -vf signalstats,metadata=print:file=- -f null - 2>&1 | awk -F= '/lavfi.signalstats.YAVG/{print $2; exit}')
+          python3 - "$MEAN" <<'PY'
+          import sys
+          v=float(sys.argv[1] or 0)
+          if v < 4:
+              raise SystemExit("output sanity failure: near-black frame")
+          PY
+          printf '{"method":"realsr-DF2K-TTA","shard":%s,"seconds":%s,"input_frames":%s}\n'             "$SHARD" "$((T1-T0))" "$COUNT_IN" > "runtime-realsr-${SHARD}.json"
+
+      - name: Upload RealSR shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovered-realsr-${{ matrix.shard }}
+          path: |
+            chunk-${{ matrix.shard }}.mp4
+            runtime-realsr-${{ matrix.shard }}.json
+          compression-level: 0
+
+  assemble-srmd:
+    needs: srmd-missing
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+      - name: Download preserved SRMD 1
+        uses: actions/download-artifact@v4
+        with:
+          name: upscale-srmd-1
+          path: all/1
+          repository: gamesbyian/S60
+          run-id: 36959736404
+          github-token: ${{ github.token }}
+      - name: Download preserved SRMD 2
+        uses: actions/download-artifact@v4
+        with:
+          name: upscale-srmd-2
+          path: all/2
+          repository: gamesbyian/S60
+          run-id: 36959736404
+          github-token: ${{ github.token }}
+      - name: Download preserved SRMD 4
+        uses: actions/download-artifact@v4
+        with:
+          name: upscale-srmd-4
+          path: all/4
+          repository: gamesbyian/S60
+          run-id: 36959736404
+          github-token: ${{ github.token }}
+      - name: Download recovered SRMD
+        uses: actions/download-artifact@v4
+        with:
+          pattern: recovered-srmd-*
+          path: recovered
+      - name: Assemble SRMD from preserved plus recovered chunks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir merged
+          for i in 1 2 4; do cp "all/$i/chunk-$i.mp4" "merged/chunk-$i.mp4"; cp "all/$i/runtime-srmd-$i.json" merged/; done
+          find recovered -type f -name 'chunk-*.mp4' -exec cp {} merged/ \;
+          find recovered -type f -name 'runtime-*.json' -exec cp {} merged/ \;
+          : > concat.txt
+          for i in 0 1 2 3 4 5; do test -s "merged/chunk-$i.mp4"; echo "file 'merged/chunk-$i.mp4'" >> concat.txt; done
+          ffmpeg -v error -f concat -safe 0 -i concat.txt -c copy srmd.mp4
+          python3 - <<'PY'
+          import glob,json
+          rows=[]
+          for p in sorted(glob.glob("merged/runtime-srmd-*.json")):
+              with open(p) as f: rows.append(json.load(f))
+          with open("srmd-runtime.json","w") as f: json.dump(rows,f,indent=2)
+          PY
+      - name: Upload assembled SRMD
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovered-assembled-srmd
+          path: |
+            srmd.mp4
+            srmd-runtime.json
+          compression-level: 0
+
+  assemble-realesrgan:
+    needs: realesrgan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: recovered-realesrgan-*
+          path: shards
+      - name: Assemble
+        shell: bash
+        run: |
+          set -euxo pipefail
+          : > concat.txt
+          for i in $(seq 0 17); do
+            P=$(find shards -type f -path "*/chunk-$i.mp4" | head -1)
+            test -s "$P"
+            echo "file '$PWD/$P'" >> concat.txt
+          done
+          ffmpeg -v error -f concat -safe 0 -i concat.txt -c copy realesrgan.mp4
+          find shards -type f -name 'runtime-*.json' -exec cp {} . \;
+          python3 - <<'PY'
+          import glob,json
+          rows=[]
+          for p in sorted(glob.glob("runtime-realesrgan-*.json")):
+              with open(p) as f: rows.append(json.load(f))
+          with open("realesrgan-runtime.json","w") as f: json.dump(rows,f,indent=2)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recovered-assembled-realesrgan
+          path: |
+            realesrgan.mp4
+            realesrgan-runtime.json
+          compression-level: 0
+
+  assemble-realsr:
+    needs: realsr
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: recovered-realsr-*
+          path: shards
+      - name: Assemble
+        shell: bash
+        run: |
+          set -euxo pipefail
+          : > concat.txt
+          for i in $(seq 0 17); do
+            P=$(find shards -type f -path "*/chunk-$i.mp4" | head -1)
+            test -s "$P"
+            echo "file '$PWD/$P'" >> concat.txt
+          done
+          ffmpeg -v error -f concat -safe 0 -i concat.txt -c copy realsr.mp4
+          find shards -type f -name 'runtime-*.json' -exec cp {} . \;
+          python3 - <<'PY'
+          import glob,json
+          rows=[]
+          for p in sorted(glob.glob("runtime-realsr-*.json")):
+              with open(p) as f: rows.append(json.load(f))
+          with open("realsr-runtime.json","w") as f: json.dump(rows,f,indent=2)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recovered-assembled-realsr
+          path: |
+            realsr.mp4
+            realsr-runtime.json
+          compression-level: 0
+
+  compare:
+    needs: [assemble-srmd, assemble-realesrgan, assemble-realsr]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+      - name: Download preserved reference/control
+        uses: actions/download-artifact@v4
+        with:
+          name: upscale-screening-prep
+          path: prep
+          repository: gamesbyian/S60
+          run-id: 36959736404
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: recovered-assembled-srmd
+          path: methods/srmd
+      - uses: actions/download-artifact@v4
+        with:
+          name: recovered-assembled-realesrgan
+          path: methods/realesrgan
+      - uses: actions/download-artifact@v4
+        with:
+          name: recovered-assembled-realsr
+          path: methods/realsr
+      - name: Build final comparison package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir stills
+          for M in realesrgan realsr srmd; do
+            ffmpeg -v error -i prep/hd-reference.mp4 -i "methods/${M}/${M}.mp4"               -filter_complex "[0:v]scale=960:540:flags=lanczos[a];[1:v]scale=960:540:flags=lanczos[b];[a][b]hstack=inputs=2[v]"               -map "[v]" -map 0:a:0? -t 90 -c:v libx264 -crf 12 -preset slow -pix_fmt yuv420p -c:a copy "compare-${M}.mp4"
+          done
+          ffmpeg -v error -i prep/hd-reference.mp4 -i prep/lanczos.mp4             -filter_complex "[0:v]scale=960:540:flags=lanczos[a];[1:v]scale=960:540:flags=lanczos[b];[a][b]hstack=inputs=2[v]"             -map "[v]" -map 0:a:0? -t 90 -c:v libx264 -crf 12 -preset slow -pix_fmt yuv420p -c:a copy compare-lanczos.mp4
+          for T in 5 20 35 50 65 80; do
+            ffmpeg -v error -ss "$T" -i prep/hd-reference.mp4 -frames:v 1 "stills/t${T}-native.png"
+            ffmpeg -v error -ss "$T" -i prep/lanczos.mp4 -frames:v 1 "stills/t${T}-lanczos.png"
+            for M in realesrgan realsr srmd; do
+              ffmpeg -v error -ss "$T" -i "methods/${M}/${M}.mp4" -frames:v 1 "stills/t${T}-${M}.png"
+            done
+          done
+      - name: Upload recovered comparison
+        uses: actions/upload-artifact@v4
+        with:
+          name: episode-01-90s-upscale-comparison-recovered
+          path: |
+            prep/hd-reference.mp4
+            prep/lanczos.mp4
+            methods/realesrgan/realesrgan.mp4
+            methods/realsr/realsr.mp4
+            methods/srmd/srmd.mp4
+            compare-*.mp4
+            stills/
+            methods/*/*runtime.json
+          compression-level: 0

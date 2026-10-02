@@ -1,0 +1,252 @@
+name: Episode 1 longform restoration dry run
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/episode-01-longform-dryrun.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  dryrun:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      FTP_HOST: wood.seedhost.eu
+      FTP_USER: ianseeds
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+
+    steps:
+      - name: Install tools
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install --quiet numpy opencv-python-headless
+
+      - name: Download episode 1 pair
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib, os
+          files={
+            "dvd.avi":"/downloads/S60/DVD/Studio 60 - 01 - Pilot.avi",
+            "hd.mp4":"/downloads/S60/1080p/Studio 60 S01E01.mp4",
+          }
+          ftp=ftplib.FTP()
+          ftp.connect(os.environ["FTP_HOST"],21,timeout=30)
+          ftp.login(os.environ["FTP_USER"],os.environ["FTP_PASSWORD"])
+          ftp.voidcmd("TYPE I")
+          for local,remote in files.items():
+              with open(local,"wb") as fh:
+                  ftp.retrbinary("RETR "+remote, fh.write, blocksize=1024*1024)
+          ftp.quit()
+          PY
+
+      - name: Extract mixed-shot validation clips
+        shell: bash
+        run: |
+          # Three 20 s stable-plateau clips selected from different timing segments.
+          # Use deterministic 5-frame-cycle decimation. mpdecimate is content-
+          # adaptive and can remove extra frames in low-motion shots, causing
+          # cumulative donor-timeline drift.
+          ffmpeg -v error -ss 280.0  -i hd.mp4  -t 20 -an -c:v ffv1 hd-a.mkv
+          ffmpeg -v error -ss 281.93 -i dvd.avi -t 21 -an -vf "decimate=cycle=5,setpts=N*1001/(24000*TB)" -r 24000/1001 -c:v ffv1 dvd-a.mkv
+
+          ffmpeg -v error -ss 1780.0 -i hd.mp4  -t 20 -an -c:v ffv1 hd-b.mkv
+          ffmpeg -v error -ss 1781.17 -i dvd.avi -t 21 -an -vf "decimate=cycle=5,setpts=N*1001/(24000*TB)" -r 24000/1001 -c:v ffv1 dvd-b.mkv
+
+          ffmpeg -v error -ss 2180.0 -i hd.mp4  -t 20 -an -c:v ffv1 hd-c.mkv
+          ffmpeg -v error -ss 2180.59 -i dvd.avi -t 21 -an -vf "decimate=cycle=5,setpts=N*1001/(24000*TB)" -r 24000/1001 -c:v ffv1 dvd-c.mkv
+
+      - name: Run dry-run registration audit
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import cv2, json, math, os, subprocess, numpy as np
+
+          clips=[("a","hd-a.mkv","dvd-a.mkv"),("b","hd-b.mkv","dvd-b.mkv"),("c","hd-c.mkv","dvd-c.mkv")]
+          roi=(170,890,384,982)
+
+          def extract(video,folder):
+              os.makedirs(folder,exist_ok=True)
+              subprocess.run(["ffmpeg","-v","error","-i",video,f"{folder}/%06d.png"],check=True)
+
+          def active_hd(img): return img[4:1076,10:1914]
+          def active_dvd(img): return img[6:470,0:848]
+
+          def register(up,hd):
+              gd=cv2.cvtColor(up,cv2.COLOR_BGR2GRAY)
+              gh=cv2.cvtColor(hd,cv2.COLOR_BGR2GRAY)
+              pts=cv2.goodFeaturesToTrack(gd,maxCorners=1600,qualityLevel=0.01,minDistance=7,blockSize=5)
+              if pts is None: return None,None
+              nxt,status,err=cv2.calcOpticalFlowPyrLK(gd,gh,pts,None,winSize=(31,31),maxLevel=4)
+              good=status.reshape(-1)==1
+              src=pts.reshape(-1,2)[good]; dst=nxt.reshape(-1,2)[good]
+              x0,y0,x1,y1=roi
+              keep=~((dst[:,0]>=x0)&(dst[:,0]<x1)&(dst[:,1]>=y0)&(dst[:,1]<y1))
+              src=src[keep]; dst=dst[keep]
+              M,inl=cv2.estimateAffinePartial2D(src,dst,method=cv2.RANSAC,ransacReprojThreshold=2.0,maxIters=4000,confidence=0.999,refineIters=30)
+              if M is None: return None,None
+              a,b,tx=M[0]; c,d,ty=M[1]
+              scale=(math.hypot(a,c)+math.hypot(b,d))/2
+              rot=math.degrees(math.atan2(c,a))
+              ni=int(inl.sum()) if inl is not None else 0
+              ok=bool(0.94<=scale<=1.06 and abs(rot)<=2 and abs(tx)<=80 and abs(ty)<=80 and ni>=50)
+              return M,{"ok":ok,"scale":float(scale),"rot":float(rot),"tx":float(tx),"ty":float(ty),"inliers":int(ni)}
+
+          all_summaries=[]
+          for name,hv,dv in clips:
+              hf=f"frames/{name}/hd"; df=f"frames/{name}/dvd"
+              extract(hv,hf); extract(dv,df)
+              hs=sorted(os.listdir(hf)); ds=sorted(os.listdir(df))
+              n=min(len(hs),len(ds))
+
+              # Load active frames once. A nominal one-to-one pairing can
+              # still be off by a frame after an edit because inverse cadence
+              # phase may reset. We therefore allow a tiny donor-frame search.
+              hactive=[]
+              dactive=[]
+              hd_gray=[]
+              dvd_gray=[]
+              for p in hs[:n]:
+                  h=active_hd(cv2.imread(f"{hf}/{p}"))
+                  hactive.append(h)
+                  hd_gray.append(cv2.resize(cv2.cvtColor(h,cv2.COLOR_BGR2GRAY),(96,54),interpolation=cv2.INTER_AREA))
+              for p in ds:
+                  d=active_dvd(cv2.imread(f"{df}/{p}"))
+                  dactive.append(d)
+                  dvd_gray.append(cv2.resize(cv2.cvtColor(d,cv2.COLOR_BGR2GRAY),(96,54),interpolation=cv2.INTER_AREA))
+
+              # Detect hard scene cuts from HD first.
+              # never allowed to bridge a cut.
+              cuts=[0]
+              cut_scores=[]
+              for i in range(1,n):
+                  mad=float(np.mean(np.abs(hd_gray[i].astype(np.float32)-hd_gray[i-1].astype(np.float32))))
+                  cut_scores.append(mad)
+                  if mad>=22.0:
+                      cuts.append(i)
+              cuts.append(n)
+              cuts=sorted(set(cuts))
+
+              # Solve one small temporal phase offset per HD shot. Compare
+              # low-resolution luminance over several interior frames and test
+              # DVD shifts of ±3 source frames. This is not optical flow or
+              # retiming; it only chooses the correct cadence-normalized donor
+              # frame at an edit boundary.
+              shot_offsets={}
+              raw=[None]*n
+              raw_donor_index=[None]*n
+              for si in range(len(cuts)-1):
+                  lo,hi=cuts[si],cuts[si+1]
+                  probes=list(range(lo,min(hi,lo+18),max(1,(min(hi,lo+18)-lo)//5 or 1)))
+                  best_shift=0; best_score=float("inf")
+                  for sh in range(-3,4):
+                      vals=[]
+                      for i in probes:
+                          j=i+sh
+                          if 0<=j<len(dvd_gray):
+                              vals.append(float(np.mean(np.abs(hd_gray[i].astype(np.float32)-dvd_gray[j].astype(np.float32)))))
+                      if vals:
+                          score=float(np.median(vals))
+                          if score<best_score:
+                              best_score=score; best_shift=sh
+                  shot_offsets[str(si)]={"start":lo,"end":hi,"dvd_shift":best_shift,"probe_mad":best_score}
+
+                  for i in range(lo,hi):
+                      j=i+best_shift
+                      if not (0<=j<len(dactive)):
+                          continue
+                      hd=hactive[i]
+                      dvd=dactive[j]
+                      up=cv2.resize(dvd,(hd.shape[1],hd.shape[0]),interpolation=cv2.INTER_LANCZOS4)
+                      M,m=register(up,hd)
+                      if M is not None and m["ok"]:
+                          raw[i]=m
+                          raw_donor_index[i]=j
+
+              recovered=[None]*n
+              source=["reject"]*n
+
+              for si in range(len(cuts)-1):
+                  lo,hi=cuts[si],cuts[si+1]
+                  valid=[i for i in range(lo,hi) if raw[i] is not None]
+                  if not valid:
+                      continue
+
+                  # A shot-level robust transform is the primary fallback.
+                  # Mapping between the DVD and HD sources should be geometrically
+                  # coherent within one edit shot; low-feature frames do not need
+                  # to solve their own affine from scratch.
+                  shot_vals={}
+                  for k in ["scale","rot","tx","ty"]:
+                      arr=np.array([raw[i][k] for i in valid],dtype=np.float64)
+                      med=float(np.median(arr))
+                      mad=float(np.median(np.abs(arr-med)))+1e-9
+                      keep=np.abs(arr-med)<=max(0.002 if k=="scale" else 0.25 if k=="rot" else 4.0, 3.5*1.4826*mad)
+                      shot_vals[k]=float(np.median(arr[keep])) if np.any(keep) else med
+                  shot_vals["inliers"]=int(np.median([raw[i]["inliers"] for i in valid]))
+                  shot_vals["ok"]=True
+
+                  # Require at least a little direct evidence. One isolated raw
+                  # solution is not enough to define an entire long shot.
+                  shot_supported=len(valid)>=3 or (hi-lo)<=12
+
+                  for i in range(lo,hi):
+                      if raw[i] is not None:
+                          recovered[i]=raw[i]
+                          source[i]="raw"
+                      elif shot_supported:
+                          recovered[i]=dict(shot_vals)
+                          source[i]="shot-median"
+
+              raw_count=sum(x is not None for x in raw)
+              rec_count=sum(x is not None for x in recovered)
+              unresolved=[i for i,x in enumerate(recovered) if x is None]
+              fallback=sum(1 for s in source if s not in ("raw","reject"))
+              shot_median_frames=sum(1 for s in source if s=="shot-median")
+
+              vals={k:[x[k] for x in recovered if x is not None] for k in ["scale","rot","tx","ty","inliers"]}
+              summary={
+                  "clip":name,
+                  "frames":n,
+                  "scene_count":max(0,len(cuts)-1),
+                  "cut_frames":cuts[1:-1],
+                  "shot_temporal_offsets":shot_offsets,
+                  "raw_accepted":raw_count,
+                  "raw_accept_rate":raw_count/max(1,n),
+                  "recovered_frames":rec_count,
+                  "recovered_accept_rate":rec_count/max(1,n),
+                  "fallback_frames":fallback,
+                  "shot_median_frames":shot_median_frames,
+                  "unresolved_frames":len(unresolved),
+                  "sample_unresolved":unresolved[:20],
+                  "median":{
+                      k:(float(np.median(v)) if v else None) for k,v in vals.items()
+                  },
+                  "p95_abs_deviation":{
+                      k:(float(np.percentile(np.abs(np.array(v)-np.median(v)),95)) if v else None)
+                      for k,v in vals.items() if k!="inliers"
+                  }
+              }
+              all_summaries.append(summary)
+
+          print("=== LONGFORM DRYRUN JSON ===")
+          print(json.dumps(all_summaries,indent=2))
+
+          if any(x["recovered_accept_rate"]<0.98 for x in all_summaries):
+              raise RuntimeError("one or more mixed-shot clips fell below 98% shot-constrained recoverable registration coverage")
+          PY
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: episode-01-longform-dryrun
+          path: |
+            hd-a.mkv
+            hd-b.mkv
+            hd-c.mkv
+          if-no-files-found: error

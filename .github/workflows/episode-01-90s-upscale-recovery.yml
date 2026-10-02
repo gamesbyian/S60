@@ -10,17 +10,132 @@ permissions:
   contents: read
   actions: read
 
-env:
-  SOURCE_RUN_ID: "36959736404"
-
 jobs:
-  srmd-missing:
+  work:
     runs-on: ubuntu-latest
     timeout-minutes: 210
     strategy:
       fail-fast: false
+      max-parallel: 8
       matrix:
-        shard: [0, 3, 5]
+        include:
+          - method: srmd
+            shard: 0
+            seconds: 15
+          - method: srmd
+            shard: 3
+            seconds: 15
+          - method: srmd
+            shard: 5
+            seconds: 15
+          - method: realesrgan
+            shard: 0
+            seconds: 5
+          - method: realesrgan
+            shard: 1
+            seconds: 5
+          - method: realesrgan
+            shard: 2
+            seconds: 5
+          - method: realesrgan
+            shard: 3
+            seconds: 5
+          - method: realesrgan
+            shard: 4
+            seconds: 5
+          - method: realesrgan
+            shard: 5
+            seconds: 5
+          - method: realesrgan
+            shard: 6
+            seconds: 5
+          - method: realesrgan
+            shard: 7
+            seconds: 5
+          - method: realesrgan
+            shard: 8
+            seconds: 5
+          - method: realesrgan
+            shard: 9
+            seconds: 5
+          - method: realesrgan
+            shard: 10
+            seconds: 5
+          - method: realesrgan
+            shard: 11
+            seconds: 5
+          - method: realesrgan
+            shard: 12
+            seconds: 5
+          - method: realesrgan
+            shard: 13
+            seconds: 5
+          - method: realesrgan
+            shard: 14
+            seconds: 5
+          - method: realesrgan
+            shard: 15
+            seconds: 5
+          - method: realesrgan
+            shard: 16
+            seconds: 5
+          - method: realesrgan
+            shard: 17
+            seconds: 5
+          - method: realsr
+            shard: 0
+            seconds: 5
+          - method: realsr
+            shard: 1
+            seconds: 5
+          - method: realsr
+            shard: 2
+            seconds: 5
+          - method: realsr
+            shard: 3
+            seconds: 5
+          - method: realsr
+            shard: 4
+            seconds: 5
+          - method: realsr
+            shard: 5
+            seconds: 5
+          - method: realsr
+            shard: 6
+            seconds: 5
+          - method: realsr
+            shard: 7
+            seconds: 5
+          - method: realsr
+            shard: 8
+            seconds: 5
+          - method: realsr
+            shard: 9
+            seconds: 5
+          - method: realsr
+            shard: 10
+            seconds: 5
+          - method: realsr
+            shard: 11
+            seconds: 5
+          - method: realsr
+            shard: 12
+            seconds: 5
+          - method: realsr
+            shard: 13
+            seconds: 5
+          - method: realsr
+            shard: 14
+            seconds: 5
+          - method: realsr
+            shard: 15
+            seconds: 5
+          - method: realsr
+            shard: 16
+            seconds: 5
+          - method: realsr
+            shard: 17
+            seconds: 5
     steps:
       - name: Download preserved prepared source
         uses: actions/download-artifact@v4
@@ -39,170 +154,74 @@ jobs:
             echo "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json" >> "$GITHUB_ENV"
           fi
 
-      - name: Install SRMD
-        run: |
-          wget -q https://github.com/nihui/srmd-ncnn-vulkan/releases/download/20220728/srmd-ncnn-vulkan-20220728-ubuntu.zip -O tool.zip
-          unzip -q tool.zip -d tool
-          chmod +x $(find tool -type f -name '*ncnn-vulkan*' | head -1)
-
-      - name: Rebuild only missing SRMD shard
+      - name: Install selected upscaler
         env:
-          SHARD: ${{ matrix.shard }}
+          METHOD: ${{ matrix.method }}
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir input output
-          START=$((SHARD * 15))
-          ffmpeg -v error -ss "$START" -i prep/dvd90-active.mkv -t 15 -vsync 0 input/%06d.png
-          BIN=$(find tool -type f -name '*ncnn-vulkan*' | head -1)
-          MODELS=$(find tool -type d -name 'models-srmd' | head -1)
-          T0=$(date +%s)
-          "$BIN" -i input -o output -s 4 -n -1 -m "$MODELS" -f png -j 2:2:2
-          T1=$(date +%s)
-          COUNT=$(find output -name '*.png' | wc -l)
-          test "$COUNT" -eq 360
-          ffmpeg -v error -framerate 24000/1001 -i output/%06d.png             -vf "scale=1904:1072:flags=lanczos,pad=1920:1080:10:4:black"             -c:v libx264 -crf 10 -preset slow -pix_fmt yuv420p -an "chunk-${SHARD}.mp4"
-          ffmpeg -v error -ss 5 -i "chunk-${SHARD}.mp4" -frames:v 1 check.png
-          MEAN=$(ffmpeg -v error -i check.png -vf signalstats,metadata=print:file=- -f null - 2>&1 | awk -F= '/lavfi.signalstats.YAVG/{print $2; exit}')
-          python3 - "$MEAN" <<'PY'
-          import sys
-          v=float(sys.argv[1] or 0)
-          if v < 4:
-              raise SystemExit("output sanity failure: near-black frame")
-          PY
-          printf '{"method":"srmd","shard":%s,"seconds":%s,"input_frames":360,"recovered":true}\n'             "$SHARD" "$((T1-T0))" > "runtime-srmd-${SHARD}.json"
-
-      - name: Upload recovered SRMD shard
-        uses: actions/upload-artifact@v4
-        with:
-          name: recovered-srmd-${{ matrix.shard }}
-          path: |
-            chunk-${{ matrix.shard }}.mp4
-            runtime-srmd-${{ matrix.shard }}.json
-          compression-level: 0
-
-  realesrgan:
-    runs-on: ubuntu-latest
-    timeout-minutes: 150
-    strategy:
-      fail-fast: false
-      max-parallel: 18
-      matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
-    steps:
-      - name: Download preserved prepared source
-        uses: actions/download-artifact@v4
-        with:
-          name: upscale-screening-prep
-          path: prep
-          repository: gamesbyian/S60
-          run-id: 36959736404
-          github-token: ${{ github.token }}
-
-      - name: Install runtime and Real-ESRGAN
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg unzip wget mesa-vulkan-drivers
-          if [ -f /usr/share/vulkan/icd.d/lvp_icd.x86_64.json ]; then
-            echo "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json" >> "$GITHUB_ENV"
-          fi
-          wget -q https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip -O tool.zip
-          unzip -q tool.zip -d tool
-          chmod +x tool/realesrgan-ncnn-vulkan
-          test -f tool/models/realesrgan-x4plus.param
-          test -f tool/models/realesrgan-x4plus.bin
-
-      - name: Upscale 5-second shard with bundled live-action model
-        env:
-          SHARD: ${{ matrix.shard }}
-        shell: bash
-        run: |
-          set -euxo pipefail
-          mkdir input output
-          START=$((SHARD * 5))
-          ffmpeg -v error -ss "$START" -i prep/dvd90-active.mkv -t 5 -vsync 0 input/%06d.png
-          COUNT_IN=$(find input -name '*.png' | wc -l)
-          test "$COUNT_IN" -ge 119
-          T0=$(date +%s)
-          tool/realesrgan-ncnn-vulkan -i input -o output -n realesrgan-x4plus -s 4 -f png -j 2:2:2 2>upscale.log
-          T1=$(date +%s)
-          COUNT_OUT=$(find output -name '*.png' | wc -l)
-          test "$COUNT_OUT" -eq "$COUNT_IN"
-          if grep -qE 'fopen .* failed|find_blob_index_by_name .* failed' upscale.log; then
-            cat upscale.log
-            exit 2
-          fi
-          ffmpeg -v error -framerate 24000/1001 -i output/%06d.png             -vf "scale=1904:1072:flags=lanczos,pad=1920:1080:10:4:black"             -c:v libx264 -crf 10 -preset slow -pix_fmt yuv420p -an "chunk-${SHARD}.mp4"
-          ffmpeg -v error -ss 2 -i "chunk-${SHARD}.mp4" -frames:v 1 check.png
-          MEAN=$(ffmpeg -v error -i check.png -vf signalstats,metadata=print:file=- -f null - 2>&1 | awk -F= '/lavfi.signalstats.YAVG/{print $2; exit}')
-          python3 - "$MEAN" <<'PY'
-          import sys
-          v=float(sys.argv[1] or 0)
-          if v < 4:
-              raise SystemExit("output sanity failure: near-black frame")
-          PY
-          printf '{"method":"realesrgan-x4plus","shard":%s,"seconds":%s,"input_frames":%s}\n'             "$SHARD" "$((T1-T0))" "$COUNT_IN" > "runtime-realesrgan-${SHARD}.json"
-
-      - name: Upload Real-ESRGAN shard
-        uses: actions/upload-artifact@v4
-        with:
-          name: recovered-realesrgan-${{ matrix.shard }}
-          path: |
-            chunk-${{ matrix.shard }}.mp4
-            runtime-realesrgan-${{ matrix.shard }}.json
-          compression-level: 0
-
-  realsr:
-    runs-on: ubuntu-latest
-    timeout-minutes: 150
-    strategy:
-      fail-fast: false
-      max-parallel: 18
-      matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
-    steps:
-      - name: Download preserved prepared source
-        uses: actions/download-artifact@v4
-        with:
-          name: upscale-screening-prep
-          path: prep
-          repository: gamesbyian/S60
-          run-id: 36959736404
-          github-token: ${{ github.token }}
-
-      - name: Install runtime and RealSR
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg unzip wget mesa-vulkan-drivers
-          if [ -f /usr/share/vulkan/icd.d/lvp_icd.x86_64.json ]; then
-            echo "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json" >> "$GITHUB_ENV"
-          fi
-          wget -q https://github.com/nihui/realsr-ncnn-vulkan/releases/download/20220728/realsr-ncnn-vulkan-20220728-ubuntu.zip -O tool.zip
+          mkdir -p tool
+          case "$METHOD" in
+            srmd)
+              wget -q https://github.com/nihui/srmd-ncnn-vulkan/releases/download/20220728/srmd-ncnn-vulkan-20220728-ubuntu.zip -O tool.zip
+              ;;
+            realesrgan)
+              wget -q https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip -O tool.zip
+              ;;
+            realsr)
+              wget -q https://github.com/nihui/realsr-ncnn-vulkan/releases/download/20220728/realsr-ncnn-vulkan-20220728-ubuntu.zip -O tool.zip
+              ;;
+          esac
           unzip -q tool.zip -d tool
           BIN=$(find tool -type f -name '*ncnn-vulkan*' | head -1)
+          test -n "$BIN"
           chmod +x "$BIN"
+          if [ "$METHOD" = "realesrgan" ]; then
+            test -f tool/models/realesrgan-x4plus.param
+            test -f tool/models/realesrgan-x4plus.bin
+          fi
 
-      - name: Upscale 5-second RealSR TTA shard
+      - name: Upscale shard
         env:
+          METHOD: ${{ matrix.method }}
           SHARD: ${{ matrix.shard }}
+          SECONDS: ${{ matrix.seconds }}
         shell: bash
         run: |
           set -euxo pipefail
           mkdir input output
-          START=$((SHARD * 5))
-          ffmpeg -v error -ss "$START" -i prep/dvd90-active.mkv -t 5 -vsync 0 input/%06d.png
+          START=$((SHARD * SECONDS))
+          ffmpeg -v error -ss "$START" -i prep/dvd90-active.mkv -t "$SECONDS" -vsync 0 input/%06d.png
           COUNT_IN=$(find input -name '*.png' | wc -l)
-          test "$COUNT_IN" -ge 119
+          test "$COUNT_IN" -gt 0
           BIN=$(find tool -type f -name '*ncnn-vulkan*' | head -1)
-          MODELS=$(find tool -type d -name 'models-DF2K' | head -1)
-          test -n "$MODELS"
           T0=$(date +%s)
-          "$BIN" -i input -o output -s 4 -x -m "$MODELS" -f png -j 2:2:2
+          case "$METHOD" in
+            srmd)
+              MODELS=$(find tool -type d -name 'models-srmd' | head -1)
+              test -n "$MODELS"
+              "$BIN" -i input -o output -s 4 -n -1 -m "$MODELS" -f png -j 2:2:2
+              ;;
+            realesrgan)
+              "$BIN" -i input -o output -n realesrgan-x4plus -s 4 -f png -j 2:2:2 2>upscale.log
+              if grep -qE 'fopen .* failed|find_blob_index_by_name .* failed' upscale.log; then
+                cat upscale.log
+                exit 2
+              fi
+              ;;
+            realsr)
+              MODELS=$(find tool -type d -name 'models-DF2K' | head -1)
+              test -n "$MODELS"
+              "$BIN" -i input -o output -s 4 -x -m "$MODELS" -f png -j 2:2:2
+              ;;
+          esac
           T1=$(date +%s)
           COUNT_OUT=$(find output -name '*.png' | wc -l)
           test "$COUNT_OUT" -eq "$COUNT_IN"
           ffmpeg -v error -framerate 24000/1001 -i output/%06d.png             -vf "scale=1904:1072:flags=lanczos,pad=1920:1080:10:4:black"             -c:v libx264 -crf 10 -preset slow -pix_fmt yuv420p -an "chunk-${SHARD}.mp4"
-          ffmpeg -v error -ss 2 -i "chunk-${SHARD}.mp4" -frames:v 1 check.png
+          CHECK_T=2
+          if [ "$SECONDS" -ge 10 ]; then CHECK_T=5; fi
+          ffmpeg -v error -ss "$CHECK_T" -i "chunk-${SHARD}.mp4" -frames:v 1 check.png
           MEAN=$(ffmpeg -v error -i check.png -vf signalstats,metadata=print:file=- -f null - 2>&1 | awk -F= '/lavfi.signalstats.YAVG/{print $2; exit}')
           python3 - "$MEAN" <<'PY'
           import sys
@@ -210,26 +229,25 @@ jobs:
           if v < 4:
               raise SystemExit("output sanity failure: near-black frame")
           PY
-          printf '{"method":"realsr-DF2K-TTA","shard":%s,"seconds":%s,"input_frames":%s}\n'             "$SHARD" "$((T1-T0))" "$COUNT_IN" > "runtime-realsr-${SHARD}.json"
+          printf '{"method":"%s","shard":%s,"seconds":%s,"input_frames":%s}\n'             "$METHOD" "$SHARD" "$((T1-T0))" "$COUNT_IN" > "runtime-${METHOD}-${SHARD}.json"
 
-      - name: Upload RealSR shard
+      - name: Upload shard
         uses: actions/upload-artifact@v4
         with:
-          name: recovered-realsr-${{ matrix.shard }}
+          name: recovered-${{ matrix.method }}-${{ matrix.shard }}
           path: |
             chunk-${{ matrix.shard }}.mp4
-            runtime-realsr-${{ matrix.shard }}.json
+            runtime-${{ matrix.method }}-${{ matrix.shard }}.json
           compression-level: 0
+          if-no-files-found: error
 
   assemble-srmd:
-    needs: srmd-missing
+    needs: work
+    if: ${{ always() && needs.work.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Install ffmpeg
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
       - name: Download preserved SRMD 1
         uses: actions/download-artifact@v4
         with:
@@ -254,12 +272,11 @@ jobs:
           repository: gamesbyian/S60
           run-id: 36959736404
           github-token: ${{ github.token }}
-      - name: Download recovered SRMD
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           pattern: recovered-srmd-*
           path: recovered
-      - name: Assemble SRMD from preserved plus recovered chunks
+      - name: Assemble
         shell: bash
         run: |
           set -euxo pipefail
@@ -277,8 +294,7 @@ jobs:
               with open(p) as f: rows.append(json.load(f))
           with open("srmd-runtime.json","w") as f: json.dump(rows,f,indent=2)
           PY
-      - name: Upload assembled SRMD
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: recovered-assembled-srmd
           path: |
@@ -287,7 +303,8 @@ jobs:
           compression-level: 0
 
   assemble-realesrgan:
-    needs: realesrgan
+    needs: work
+    if: ${{ always() && needs.work.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -324,7 +341,8 @@ jobs:
           compression-level: 0
 
   assemble-realsr:
-    needs: realsr
+    needs: work
+    if: ${{ always() && needs.work.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -365,7 +383,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
       - name: Download preserved reference/control
         uses: actions/download-artifact@v4
         with:
@@ -402,8 +420,7 @@ jobs:
               ffmpeg -v error -ss "$T" -i "methods/${M}/${M}.mp4" -frames:v 1 "stills/t${T}-${M}.png"
             done
           done
-      - name: Upload recovered comparison
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: episode-01-90s-upscale-comparison-recovered
           path: |

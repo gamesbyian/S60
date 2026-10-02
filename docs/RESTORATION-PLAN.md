@@ -277,10 +277,12 @@ Key current conclusions:
 
 ## Near-term queue
 
-1. Finish the episode 1 network-bug mask experiment.
-2. Produce several actual restored-frame prototypes.
-3. Compare hard-mask, feathered-mask, and local color/luma-matched compositing.
-4. Test temporal stability over short restored clips.
-5. Use the 720p source only as a secondary validation/reference source, since it also contains the network bug.
-6. Lock the minimum-quality final encode strategy only after the visual restoration method is proven.
-7. Generalize characterization and timeline mapping across all 22 episodes.
+1. Finish and visually review the current three-minute Episode 1 restoration validation.
+2. Implement the streaming performance architecture in `docs/PERFORMANCE-ARCHITECTURE.md`.
+3. Reproduce the same three-minute window through the single-shard streaming renderer and prove pre-encode pixel parity with the validated prototype.
+4. Benchmark 1, 2, 4, and 8 shot-aligned render shards; select the default based on wall-clock time, total runner-minutes, transfer overhead, and artifact overhead.
+5. Finalize Episode 1's complete piecewise time map, including remaining head/tail and timing-boundary work.
+6. Run the first whole-Episode-1 diagnostic restoration only after streaming parity and sharding validation pass.
+7. Complete whole-episode QA and choose the final encode strategy.
+8. Generalize characterization, mask/layout validation, and timeline mapping across all 22 episodes.
+9. Keep the 720p source as secondary validation/reference only, since it also contains the network bug.

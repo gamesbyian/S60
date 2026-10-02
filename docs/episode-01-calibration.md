@@ -173,3 +173,24 @@ The dark 2200 s calibration frame produced a full NBC peacock + `.com` silhouett
 Visual review of the 0900 and 2200 comparisons confirms that the shaped mask removes the NBC.com overlay while preserving surrounding native 1080p content. The 2200 sample is especially clean; the 0900 sample demonstrates that the shaped mask avoids the large tonal slab seen in the earlier rectangular prototype.
 
 This is the current episode 1 baseline: conservative ROI for search/registration, logo-shaped alpha for actual replacement, no broad photometric remapping, and strict registration rejection.
+
+
+## Temporal restoration validation
+
+A six-second stable clip around HD t=2197–2203 s was restored frame-by-frame after first inverse-cadence normalizing the DVD from 30000/1001 to 24000/1001.
+
+Results:
+
+- HD frames considered: 143
+- Accepted registrations: 143
+- Rejected registrations: 0
+- Registration acceptance rate: 100%
+- Mean temporal change inside/around the repaired mask: ~3.34 luma levels
+- 95th percentile temporal change: ~14.96 luma levels
+- Representative repaired-logo residuals remained around 0.77 luma levels against the registered clean donor, versus roughly 52 luma levels before repair.
+
+The preceding failed run paired 23.976 HD frames directly against the still-29.97 DVD cadence and accepted only 70/143 frames. This confirms that cadence normalization is required before framewise temporal pairing.
+
+A separate low-rate correspondence probe across the first timing discontinuity showed a stable +1 frame offset at 8 fps through index 59, followed by a sharp jump at index 60. With the HD boundary clip starting at 556.0 s, that places the correspondence break at roughly 563.5 s, consistent with the earlier refined 555–570 s transition interval.
+
+Current conclusion: the shaped repair is stable over ordinary motion when temporal cadence is normalized correctly. Production restoration should use explicit piecewise timing segments and cadence-normalized DVD donor frames; it should not rely on one continuous global offset.

@@ -214,7 +214,38 @@ jobs:
               d=active_dvd(cv2.imread("frames/dvd/"+ds[j]))
               up=cv2.resize(d,(h.shape[1],h.shape[0]),interpolation=cv2.INTER_LANCZOS4)
               donor=cv2.warpAffine(up,p["M"],(h.shape[1],h.shape[0]),flags=cv2.INTER_LANCZOS4)
-              restored=np.clip(h.astype(np.float32)*(1-alpha[:,:,None])+donor.astype(np.float32)*alpha[:,:,None],0,255).astype(np.uint8)
+
+              # Robust local donor-to-HD tone fit. Measure only in a narrow ring
+              # surrounding the logo, exclude the logo itself, clamp aggressively,
+              # and apply the correction only to donor pixels under the alpha.
+              binmask=(alpha>0.01).astype(np.uint8)
+              outer=cv2.dilate(binmask,np.ones((17,17),np.uint8),iterations=1).astype(bool)
+              inner=cv2.dilate(binmask,np.ones((3,3),np.uint8),iterations=1).astype(bool)
+              ring=outer & (~inner)
+
+              donor_f=donor.astype(np.float32)
+              h_f=h.astype(np.float32)
+              corrected=donor_f.copy()
+              for ch in range(3):
+                  x=donor_f[:,:,ch][ring]
+                  y=h_f[:,:,ch][ring]
+                  if x.size>=200:
+                      # Trim strong outliers caused by residual misregistration,
+                      # highlights, and compression differences.
+                      diff=y-x
+                      lo,hi=np.percentile(diff,[10,90])
+                      keep=(diff>=lo)&(diff<=hi)
+                      x2=x[keep]; y2=y[keep]
+                      if x2.size>=100:
+                          xm=float(np.median(x2)); ym=float(np.median(y2))
+                          xs=float(np.median(np.abs(x2-xm)))+1e-6
+                          ys=float(np.median(np.abs(y2-ym)))+1e-6
+                          gain=float(np.clip(ys/xs,0.94,1.06))
+                          bias=float(np.clip(ym-gain*xm,-8.0,8.0))
+                          corrected[:,:,ch]=np.clip(donor_f[:,:,ch]*gain+bias,0,255)
+
+              a3=alpha[:,:,None]
+              restored=np.clip(h_f*(1-a3)+corrected*a3,0,255).astype(np.uint8)
               hfull[4:1076,10:1914]=restored
               cv2.imwrite(f"restored/{i+1:06d}.png",hfull)
 

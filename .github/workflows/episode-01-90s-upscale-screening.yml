@@ -1,0 +1,313 @@
+name: Episode 1 90-second upscale screening
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/episode-01-90s-upscale-screening.yml"
+      - "docs/UPSCALE-SCREENING.md"
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FTP_HOST: wood.seedhost.eu
+      FTP_USER: ianseeds
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+    steps:
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: Download Episode 1 sources
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib, os
+          files={
+            "dvd.avi":"/downloads/S60/DVD/Studio 60 - 01 - Pilot.avi",
+            "hd.mp4":"/downloads/S60/1080p/Studio 60 S01E01.mp4",
+          }
+          ftp=ftplib.FTP()
+          ftp.connect(os.environ["FTP_HOST"],21,timeout=30)
+          ftp.login(os.environ["FTP_USER"],os.environ["FTP_PASSWORD"])
+          ftp.voidcmd("TYPE I")
+          for local,remote in files.items():
+              with open(local,"wb") as fh:
+                  ftp.retrbinary("RETR "+remote,fh.write,blocksize=1024*1024)
+          ftp.quit()
+          PY
+
+      - name: Prepare synchronized 90-second sources
+        shell: bash
+        run: |
+          # HD 1760..1850 lies within the known +1.17 s Episode 1 timing plateau.
+          # Keep the HD review reference at native geometry and cadence.
+          ffmpeg -v error -ss 1760.0 -i hd.mp4 -t 90             -map 0:v:0 -map 0:a:0?             -c:v libx264 -crf 10 -preset slow -pix_fmt yuv420p             -c:a copy hd-reference.mp4
+
+          # Clean DVD donor: deterministic inverse cadence, crop to measured
+          # active picture, and keep it lossless for every upscaler.
+          ffmpeg -v error -ss 1761.17 -i dvd.avi -t 90.6 -an             -vf "decimate=cycle=5,setpts=N*1001/(24000*TB),crop=848:464:0:6"             -r 24000/1001 -c:v ffv1 dvd90-active.mkv
+
+          # Non-neural control. Match gross HD active-picture geometry.
+          ffmpeg -v error -i dvd90-active.mkv -t 90             -vf "scale=1904:1072:flags=lanczos,pad=1920:1080:10:4:black"             -c:v libx264 -crf 10 -preset slow -pix_fmt yuv420p             -an lanczos.mp4
+
+          # Basic sanity.
+          ffprobe -v error -count_frames -select_streams v:0             -show_entries stream=width,height,avg_frame_rate,nb_read_frames             -of json dvd90-active.mkv hd-reference.mp4 lanczos.mp4 > prep-probe.json
+
+      - name: Upload prepared source artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: upscale-screening-prep
+          path: |
+            dvd90-active.mkv
+            hd-reference.mp4
+            lanczos.mp4
+            prep-probe.json
+          compression-level: 0
+          if-no-files-found: error
+
+  upscale:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 18
+      matrix:
+        method: [realesrgan, realsr, srmd]
+        shard: [0, 1, 2, 3, 4, 5]
+    steps:
+      - name: Download prepared source
+        uses: actions/download-artifact@v4
+        with:
+          name: upscale-screening-prep
+
+      - name: Install runtime
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg unzip wget mesa-vulkan-drivers vulkan-tools
+          if [ -f /usr/share/vulkan/icd.d/lvp_icd.x86_64.json ]; then
+            echo "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json" >> "$GITHUB_ENV"
+          fi
+          vulkaninfo --summary || true
+
+      - name: Install selected upscaler
+        shell: bash
+        env:
+          METHOD: ${{ matrix.method }}
+        run: |
+          set -euxo pipefail
+          mkdir -p tool
+          case "$METHOD" in
+            realesrgan)
+              wget -q https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip -O tool.zip
+              ;;
+            realsr)
+              wget -q https://github.com/nihui/realsr-ncnn-vulkan/releases/download/20220728/realsr-ncnn-vulkan-20220728-ubuntu.zip -O tool.zip
+              ;;
+            srmd)
+              wget -q https://github.com/nihui/srmd-ncnn-vulkan/releases/download/20220728/srmd-ncnn-vulkan-20220728-ubuntu.zip -O tool.zip
+              ;;
+          esac
+          unzip -q tool.zip -d tool
+          find tool -maxdepth 3 -type f -print
+          chmod +x $(find tool -type f -name '*ncnn-vulkan*' | head -1)
+
+      - name: Extract shard frames
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          mkdir -p input output
+          START=$((SHARD * 15))
+          ffmpeg -v error -ss "$START" -i dvd90-active.mkv -t 15             -vsync 0 input/%06d.png
+          echo "input_frames=$(find input -name '*.png' | wc -l)"
+
+      - name: Upscale shard
+        shell: bash
+        env:
+          METHOD: ${{ matrix.method }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euxo pipefail
+          BIN=$(find tool -type f -name '*ncnn-vulkan*' | head -1)
+          START_EPOCH=$(date +%s)
+
+          case "$METHOD" in
+            realesrgan)
+              "$BIN" -i input -o output -n realesrgan-x4plus -s 4 -f png -j 2:2:2
+              ;;
+            realsr)
+              MODELS=$(find tool -type d -name 'models-DF2K' | head -1)
+              "$BIN" -i input -o output -s 4 -m "$MODELS" -f png -j 2:2:2
+              ;;
+            srmd)
+              MODELS=$(find tool -type d -name 'models-srmd' | head -1)
+              "$BIN" -i input -o output -s 4 -n -1 -m "$MODELS" -f png -j 2:2:2
+              ;;
+          esac
+
+          END_EPOCH=$(date +%s)
+          ELAPSED=$((END_EPOCH - START_EPOCH))
+          printf '{"method":"%s","shard":%s,"seconds":%s,"input_frames":%s}\n'             "$METHOD" "$SHARD" "$ELAPSED" "$(find input -name '*.png' | wc -l)"             > "runtime-${METHOD}-${SHARD}.json"
+
+      - name: Normalize and encode shard
+        shell: bash
+        env:
+          METHOD: ${{ matrix.method }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          # Neural tools output x4 frames. Normalize to the same gross active
+          # geometry used by the reference/control and use one common review encode.
+          ffmpeg -v error -framerate 24000/1001 -i output/%06d.png             -vf "scale=1904:1072:flags=lanczos,pad=1920:1080:10:4:black"             -c:v libx264 -crf 10 -preset slow -pix_fmt yuv420p -an             "chunk-${SHARD}.mp4"
+
+      - name: Upload shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: upscale-${{ matrix.method }}-${{ matrix.shard }}
+          path: |
+            chunk-${{ matrix.shard }}.mp4
+            runtime-${{ matrix.method }}-${{ matrix.shard }}.json
+          compression-level: 0
+          if-no-files-found: error
+
+  assemble:
+    needs: upscale
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        method: [realesrgan, realsr, srmd]
+    steps:
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: Download method shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: upscale-${{ matrix.method }}-*
+          path: shards
+          merge-multiple: true
+
+      - name: Assemble method clip
+        shell: bash
+        env:
+          METHOD: ${{ matrix.method }}
+        run: |
+          set -euxo pipefail
+          : > concat.txt
+          for i in 0 1 2 3 4 5; do
+            echo "file 'shards/chunk-${i}.mp4'" >> concat.txt
+          done
+          ffmpeg -v error -f concat -safe 0 -i concat.txt -c copy "${METHOD}.mp4"
+          python3 - <<'PY'
+          import glob,json,os
+          rows=[]
+          for p in sorted(glob.glob("shards/runtime-*.json")):
+              with open(p) as f: rows.append(json.load(f))
+          out={
+              "method":os.environ["METHOD"],
+              "shards":rows,
+              "total_compute_seconds":sum(x["seconds"] for x in rows),
+              "max_shard_seconds":max(x["seconds"] for x in rows),
+              "frames":sum(x["input_frames"] for x in rows),
+          }
+          with open(os.environ["METHOD"]+"-runtime.json","w") as f:
+              json.dump(out,f,indent=2)
+          print(json.dumps(out,indent=2))
+          PY
+
+      - name: Upload assembled method
+        uses: actions/upload-artifact@v4
+        with:
+          name: upscale-assembled-${{ matrix.method }}
+          path: |
+            ${{ matrix.method }}.mp4
+            ${{ matrix.method }}-runtime.json
+          compression-level: 0
+          if-no-files-found: error
+
+  compare:
+    needs: [prepare, assemble]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+
+      - name: Download reference and control
+        uses: actions/download-artifact@v4
+        with:
+          name: upscale-screening-prep
+          path: prep
+
+      - name: Download assembled neural candidates
+        uses: actions/download-artifact@v4
+        with:
+          pattern: upscale-assembled-*
+          path: methods
+          merge-multiple: true
+
+      - name: Build synchronized comparison package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p stills
+
+          # Pairwise review videos. Audio always comes from the native HD reference.
+          for M in realesrgan realsr srmd; do
+            ffmpeg -v error               -i prep/hd-reference.mp4 -i "methods/${M}.mp4"               -filter_complex               "[0:v]scale=960:540:flags=lanczos,drawtext=text='Native 1080p':x=20:y=20:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.55[a];                [1:v]scale=960:540:flags=lanczos,drawtext=text='${M} from clean DVD':x=20:y=20:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.55[b];                [a][b]hstack=inputs=2[v]"               -map "[v]" -map 0:a:0? -t 90               -c:v libx264 -crf 12 -preset slow -pix_fmt yuv420p -c:a copy               "compare-${M}.mp4"
+          done
+
+          ffmpeg -v error             -i prep/hd-reference.mp4 -i prep/lanczos.mp4             -filter_complex             "[0:v]scale=960:540:flags=lanczos,drawtext=text='Native 1080p':x=20:y=20:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.55[a];              [1:v]scale=960:540:flags=lanczos,drawtext=text='Lanczos clean DVD':x=20:y=20:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.55[b];              [a][b]hstack=inputs=2[v]"             -map "[v]" -map 0:a:0? -t 90             -c:v libx264 -crf 12 -preset slow -pix_fmt yuv420p -c:a copy             compare-lanczos.mp4
+
+          # Full-resolution stills at identical moments.
+          for T in 5 20 35 50 65 80; do
+            ffmpeg -v error -ss "$T" -i prep/hd-reference.mp4 -frames:v 1 "stills/t${T}-native.png"
+            ffmpeg -v error -ss "$T" -i prep/lanczos.mp4 -frames:v 1 "stills/t${T}-lanczos.png"
+            for M in realesrgan realsr srmd; do
+              ffmpeg -v error -ss "$T" -i "methods/${M}.mp4" -frames:v 1 "stills/t${T}-${M}.png"
+            done
+          done
+
+          python3 - <<'PY'
+          import glob,json
+          rows=[]
+          for p in sorted(glob.glob("methods/*-runtime.json")):
+              with open(p) as f: rows.append(json.load(f))
+          with open("runtime-summary.json","w") as f:
+              json.dump(rows,f,indent=2)
+          print(json.dumps(rows,indent=2))
+          PY
+
+      - name: Upload complete comparison package
+        uses: actions/upload-artifact@v4
+        with:
+          name: episode-01-90s-upscale-comparison
+          path: |
+            prep/hd-reference.mp4
+            prep/lanczos.mp4
+            methods/realesrgan.mp4
+            methods/realsr.mp4
+            methods/srmd.mp4
+            compare-realesrgan.mp4
+            compare-realsr.mp4
+            compare-srmd.mp4
+            compare-lanczos.mp4
+            stills/
+            runtime-summary.json
+            prep/prep-probe.json
+          compression-level: 0
+          if-no-files-found: error

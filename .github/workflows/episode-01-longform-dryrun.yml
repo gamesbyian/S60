@@ -49,14 +49,17 @@ jobs:
         shell: bash
         run: |
           # Three 20 s stable-plateau clips selected from different timing segments.
+          # Use deterministic 5-frame-cycle decimation. mpdecimate is content-
+          # adaptive and can remove extra frames in low-motion shots, causing
+          # cumulative donor-timeline drift.
           ffmpeg -v error -ss 280.0  -i hd.mp4  -t 20 -an -c:v ffv1 hd-a.mkv
-          ffmpeg -v error -ss 281.93 -i dvd.avi -t 21 -an -vf "mpdecimate,setpts=N*1001/(24000*TB)" -r 24000/1001 -c:v ffv1 dvd-a.mkv
+          ffmpeg -v error -ss 281.93 -i dvd.avi -t 21 -an -vf "decimate=cycle=5,setpts=N*1001/(24000*TB)" -r 24000/1001 -c:v ffv1 dvd-a.mkv
 
           ffmpeg -v error -ss 1780.0 -i hd.mp4  -t 20 -an -c:v ffv1 hd-b.mkv
-          ffmpeg -v error -ss 1781.17 -i dvd.avi -t 21 -an -vf "mpdecimate,setpts=N*1001/(24000*TB)" -r 24000/1001 -c:v ffv1 dvd-b.mkv
+          ffmpeg -v error -ss 1781.17 -i dvd.avi -t 21 -an -vf "decimate=cycle=5,setpts=N*1001/(24000*TB)" -r 24000/1001 -c:v ffv1 dvd-b.mkv
 
           ffmpeg -v error -ss 2180.0 -i hd.mp4  -t 20 -an -c:v ffv1 hd-c.mkv
-          ffmpeg -v error -ss 2180.59 -i dvd.avi -t 21 -an -vf "mpdecimate,setpts=N*1001/(24000*TB)" -r 24000/1001 -c:v ffv1 dvd-c.mkv
+          ffmpeg -v error -ss 2180.59 -i dvd.avi -t 21 -an -vf "decimate=cycle=5,setpts=N*1001/(24000*TB)" -r 24000/1001 -c:v ffv1 dvd-c.mkv
 
       - name: Run dry-run registration audit
         shell: bash

@@ -10,6 +10,13 @@ permissions:
   contents: read
   actions: read
 
+# A new push to this PR can otherwise launch another copy of the same expensive
+# recovery workflow because pull_request path filters are evaluated against the
+# PR's cumulative diff. Keep only the newest run for this PR/ref.
+concurrency:
+  group: upscale-recovery-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   work:
     runs-on: ubuntu-latest

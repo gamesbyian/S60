@@ -1,0 +1,235 @@
+name: Episode 1 temporal restoration validation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/episode-01-temporal-validation.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FTP_HOST: wood.seedhost.eu
+      FTP_USER: ianseeds
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+
+    steps:
+      - name: Install tools
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install --quiet numpy opencv-python-headless
+
+      - name: Download episode 1 pair
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib, os
+          files={
+            "dvd.avi":"/downloads/S60/DVD/Studio 60 - 01 - Pilot.avi",
+            "hd.mp4":"/downloads/S60/1080p/Studio 60 S01E01.mp4",
+          }
+          ftp=ftplib.FTP()
+          ftp.connect(os.environ["FTP_HOST"],21,timeout=30)
+          ftp.login(os.environ["FTP_USER"],os.environ["FTP_PASSWORD"])
+          ftp.voidcmd("TYPE I")
+          for local,remote in files.items():
+              with open(local,"wb") as fh:
+                  ftp.retrbinary("RETR "+remote, fh.write, blocksize=1024*1024)
+          ftp.quit()
+          PY
+
+      - name: Extract short matched clips
+        shell: bash
+        run: |
+          # Stable plateau clip around 2200 s.
+          ffmpeg -v error -ss 2197.0 -i hd.mp4  -t 6 -an -c:v ffv1 hd-stable.mkv
+          ffmpeg -v error -ss 2197.59 -i dvd.avi -t 6 -an -c:v ffv1 dvd-stable.mkv
+
+          # Clip spanning the first timing discontinuity around 560 s.
+          ffmpeg -v error -ss 556.0 -i hd.mp4  -t 12 -an -c:v ffv1 hd-boundary.mkv
+          ffmpeg -v error -ss 557.93 -i dvd.avi -t 12 -an -c:v ffv1 dvd-boundary.mkv
+
+      - name: Restore stable clip frame by frame
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import cv2, json, math, os, subprocess, numpy as np
+
+          os.makedirs("out",exist_ok=True)
+          os.makedirs("frames/stable/hd",exist_ok=True)
+          os.makedirs("frames/stable/dvd",exist_ok=True)
+
+          subprocess.run(["ffmpeg","-v","error","-i","hd-stable.mkv","frames/stable/hd/%06d.png"],check=True)
+          subprocess.run(["ffmpeg","-v","error","-i","dvd-stable.mkv","frames/stable/dvd/%06d.png"],check=True)
+
+          hd_files=sorted(os.listdir("frames/stable/hd"))
+          dvd_files=sorted(os.listdir("frames/stable/dvd"))
+          n=min(len(hd_files),len(dvd_files))
+
+          # Calibrated active-picture mask from the accepted still prototype.
+          x0,y0,x1,y1=185,890,371,968
+          # Approximate logo silhouette seed from a well-registered frame at 2200.
+          # Re-derive once from the first clip frame so the workflow is self-contained.
+          def active_hd(img): return img[4:1076,10:1914]
+          def active_dvd(img): return img[6:470,0:848]
+
+          def register(up,hd):
+              gd=cv2.cvtColor(up,cv2.COLOR_BGR2GRAY)
+              gh=cv2.cvtColor(hd,cv2.COLOR_BGR2GRAY)
+              pts=cv2.goodFeaturesToTrack(gd,maxCorners=1800,qualityLevel=0.01,minDistance=7,blockSize=5)
+              if pts is None: return None,None
+              nxt,status,err=cv2.calcOpticalFlowPyrLK(gd,gh,pts,None,winSize=(31,31),maxLevel=4)
+              good=status.reshape(-1)==1
+              src=pts.reshape(-1,2)[good]; dst=nxt.reshape(-1,2)[good]
+              keep=~((dst[:,0]>=170)&(dst[:,0]<384)&(dst[:,1]>=890)&(dst[:,1]<982))
+              src=src[keep]; dst=dst[keep]
+              M,inl=cv2.estimateAffinePartial2D(src,dst,method=cv2.RANSAC,ransacReprojThreshold=2.0,maxIters=5000,confidence=0.999,refineIters=50)
+              if M is None: return None,None
+              a,b,tx=M[0]; c,d,ty=M[1]
+              scale=(math.hypot(a,c)+math.hypot(b,d))/2
+              rot=math.degrees(math.atan2(c,a))
+              ni=int(inl.sum()) if inl is not None else 0
+              ok=(0.94<=scale<=1.06 and abs(rot)<=2 and abs(tx)<=80 and abs(ty)<=80 and ni>=50)
+              return M,{"ok":ok,"scale":scale,"rot":rot,"tx":float(tx),"ty":float(ty),"inliers":ni}
+
+          # Build alpha from first good frame.
+          alpha=None
+          metrics=[]
+          prev_restored=None
+          temporal=[]
+
+          for idx in range(n):
+              hd_full=cv2.imread("frames/stable/hd/"+hd_files[idx])
+              dvd_full=cv2.imread("frames/stable/dvd/"+dvd_files[idx])
+              if hd_full is None or dvd_full is None: continue
+              hd=active_hd(hd_full)
+              dvd=active_dvd(dvd_full)
+              up=cv2.resize(dvd,(hd.shape[1],hd.shape[0]),interpolation=cv2.INTER_LANCZOS4)
+              M,m=register(up,hd)
+              if M is None or not m["ok"]:
+                  metrics.append({"frame":idx,"accepted":False,"registration":m})
+                  continue
+              donor=cv2.warpAffine(up,M,(hd.shape[1],hd.shape[0]),flags=cv2.INTER_LANCZOS4)
+
+              if alpha is None:
+                  dg=cv2.cvtColor(donor,cv2.COLOR_BGR2GRAY).astype(np.int16)
+                  hg=cv2.cvtColor(hd,cv2.COLOR_BGR2GRAY).astype(np.int16)
+                  roi=np.abs(hg-dg)[890:982,170:384].astype(np.uint8)
+                  seed=(roi>=18).astype(np.uint8)*255
+                  seed=cv2.morphologyEx(seed,cv2.MORPH_OPEN,np.ones((2,2),np.uint8))
+                  seed=cv2.morphologyEx(seed,cv2.MORPH_CLOSE,np.ones((5,5),np.uint8))
+                  ncc,labels,stats,cent=cv2.connectedComponentsWithStats(seed,8)
+                  kept=np.zeros_like(seed)
+                  for i in range(1,ncc):
+                      area=int(stats[i,cv2.CC_STAT_AREA])
+                      if area>=25: kept[labels==i]=255
+                  kept=cv2.morphologyEx(kept,cv2.MORPH_CLOSE,np.ones((9,5),np.uint8))
+                  kept=cv2.dilate(kept,np.ones((3,3),np.uint8),iterations=1)
+                  full=np.zeros((1072,1904),dtype=np.uint8)
+                  full[890:982,170:384]=kept
+                  alpha=cv2.GaussianBlur(full,(0,0),sigmaX=1.1,sigmaY=1.1).astype(np.float32)/255.0
+
+              a3=alpha[:,:,None]
+              restored=np.clip(hd.astype(np.float32)*(1-a3)+donor.astype(np.float32)*a3,0,255).astype(np.uint8)
+
+              restored_full=hd_full.copy()
+              restored_full[4:1076,10:1914]=restored
+              cv2.imwrite(f"out/stable-{idx:06d}.png",restored_full)
+
+              core=alpha>0.5
+              before=np.abs(cv2.cvtColor(hd,cv2.COLOR_BGR2GRAY).astype(np.float32)-cv2.cvtColor(donor,cv2.COLOR_BGR2GRAY).astype(np.float32))
+              after=np.abs(cv2.cvtColor(restored,cv2.COLOR_BGR2GRAY).astype(np.float32)-cv2.cvtColor(donor,cv2.COLOR_BGR2GRAY).astype(np.float32))
+              metrics.append({
+                  "frame":idx,"accepted":True,"registration":m,
+                  "core_diff_before":float(np.mean(before[core])),
+                  "core_diff_after":float(np.mean(after[core]))
+              })
+
+              if prev_restored is not None:
+                  # Temporal change only inside a slightly expanded mask versus
+                  # native HD temporal change in the same pixels.
+                  region=cv2.dilate((alpha>0.01).astype(np.uint8)*255,np.ones((5,5),np.uint8),1)>0
+                  prevg=cv2.cvtColor(prev_restored,cv2.COLOR_BGR2GRAY).astype(np.float32)
+                  currg=cv2.cvtColor(restored,cv2.COLOR_BGR2GRAY).astype(np.float32)
+                  temporal.append(float(np.mean(np.abs(currg[region]-prevg[region]))))
+              prev_restored=restored
+
+          accepted=sum(1 for x in metrics if x["accepted"])
+          rejected=len(metrics)-accepted
+          scales=[x["registration"]["scale"] for x in metrics if x["accepted"]]
+          txs=[x["registration"]["tx"] for x in metrics if x["accepted"]]
+          tys=[x["registration"]["ty"] for x in metrics if x["accepted"]]
+          rots=[x["registration"]["rot"] for x in metrics if x["accepted"]]
+
+          summary={
+              "frames_considered":len(metrics),
+              "accepted":accepted,
+              "rejected":rejected,
+              "accept_rate":accepted/max(1,len(metrics)),
+              "registration_std":{
+                  "scale":float(np.std(scales)) if scales else None,
+                  "tx":float(np.std(txs)) if txs else None,
+                  "ty":float(np.std(tys)) if tys else None,
+                  "rot":float(np.std(rots)) if rots else None,
+              },
+              "temporal_mask_delta_mean":float(np.mean(temporal)) if temporal else None,
+              "temporal_mask_delta_p95":float(np.percentile(temporal,95)) if temporal else None,
+              "sample_metrics":metrics[:12]
+          }
+          print("=== STABLE CLIP TEMPORAL JSON ===")
+          print(json.dumps(summary,indent=2))
+
+          if accepted < max(20,int(0.7*len(metrics))):
+              raise RuntimeError(f"too many registration rejects: {accepted}/{len(metrics)}")
+          PY
+
+      - name: Encode restored stable sample
+        shell: bash
+        run: |
+          ffmpeg -v error -framerate 24000/1001 -i out/stable-%06d.png -c:v libx264 -crf 10 -preset slow -pix_fmt yuv420p restored-stable-sample.mp4
+
+      - name: Probe boundary clip alignment behavior
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import subprocess, numpy as np, json
+
+          # Use audio-less decoded luminance fingerprints at low rate to verify
+          # the known discontinuity manifests as an abrupt correspondence break,
+          # not smooth drift. This is diagnostic only.
+          def sig(path):
+              p=subprocess.run([
+                  "ffmpeg","-v","error","-i",path,"-vf","fps=8,scale=64:36,format=gray",
+                  "-f","rawvideo","-pix_fmt","gray","-"
+              ],check=True,stdout=subprocess.PIPE).stdout
+              a=np.frombuffer(p,dtype=np.uint8)
+              frame=64*36
+              a=a[:len(a)//frame*frame].reshape(-1,frame).astype(np.float32)
+              return a
+          h=sig("hd-boundary.mkv")
+          d=sig("dvd-boundary.mkv")
+          # nearest-match frame index over ±24 low-rate frames
+          rows=[]
+          for i in range(min(len(h),96)):
+              lo=max(0,i-24); hi=min(len(d),i+25)
+              errs=np.mean(np.abs(d[lo:hi]-h[i]),axis=1)
+              j=lo+int(np.argmin(errs))
+              rows.append({"hd_index":i,"dvd_index":j,"delta_frames_8fps":j-i,"mad":float(np.min(errs))})
+          print("=== BOUNDARY CLIP CORRESPONDENCE JSON ===")
+          print(json.dumps(rows,indent=2))
+          PY
+
+      - name: Upload temporal validation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: episode-01-temporal-validation
+          path: |
+            restored-stable-sample.mp4
+          if-no-files-found: error

@@ -157,3 +157,19 @@ Findings:
 - The conservative bounding box remains useful as a search/processing ROI, not as the area to replace.
 
 Current direction: derive a persistent logo-shaped alpha mask inside the ROI, fit donor-to-HD tone using robust paired pixels outside the logo, reject pathological fits, and modify only masked pixels.
+
+
+## Calibrated logo-shaped repair result
+
+The dark 2200 s calibration frame produced a full NBC peacock + `.com` silhouette that validated visually across the other good-registration samples.
+
+- Mask bounding box in active-picture coordinates: x=185..371, y=890..968
+- Pixels with alpha > 1%: 8,012
+- Pixels with alpha > 50%: 6,415
+- Fraction of full 1920×1080 frame with alpha > 1%: ~0.386%
+- Fraction of full frame with alpha > 50%: ~0.309%
+- The 1500 s sample continues to fail registration quality gates and is correctly rejected.
+
+Visual review of the 0900 and 2200 comparisons confirms that the shaped mask removes the NBC.com overlay while preserving surrounding native 1080p content. The 2200 sample is especially clean; the 0900 sample demonstrates that the shaped mask avoids the large tonal slab seen in the earlier rectangular prototype.
+
+This is the current episode 1 baseline: conservative ROI for search/registration, logo-shaped alpha for actual replacement, no broad photometric remapping, and strict registration rejection.

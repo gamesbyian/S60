@@ -50,11 +50,17 @@ jobs:
         run: |
           # Stable plateau clip around 2200 s.
           ffmpeg -v error -ss 2197.0 -i hd.mp4  -t 6 -an -c:v ffv1 hd-stable.mkv
-          ffmpeg -v error -ss 2197.59 -i dvd.avi -t 6 -an -c:v ffv1 dvd-stable.mkv
+          # DVD is 30000/1001 with one repeated frame per five-frame cadence.
+          # Decimate it back to the 24000/1001 source cadence before pairing
+          # frames with the HD master. This avoids steadily pairing HD frames
+          # against the wrong DVD cadence member.
+          ffmpeg -v error -ss 2197.59 -i dvd.avi -t 6.5 -an \
+            -vf "mpdecimate,setpts=N*1001/(24000*TB)" -r 24000/1001 -c:v ffv1 dvd-stable.mkv
 
           # Clip spanning the first timing discontinuity around 560 s.
           ffmpeg -v error -ss 556.0 -i hd.mp4  -t 12 -an -c:v ffv1 hd-boundary.mkv
-          ffmpeg -v error -ss 557.93 -i dvd.avi -t 12 -an -c:v ffv1 dvd-boundary.mkv
+          ffmpeg -v error -ss 557.93 -i dvd.avi -t 12.5 -an \
+            -vf "mpdecimate,setpts=N*1001/(24000*TB)" -r 24000/1001 -c:v ffv1 dvd-boundary.mkv
 
       - name: Restore stable clip frame by frame
         shell: bash
@@ -72,6 +78,7 @@ jobs:
           hd_files=sorted(os.listdir("frames/stable/hd"))
           dvd_files=sorted(os.listdir("frames/stable/dvd"))
           n=min(len(hd_files),len(dvd_files))
+          print(f"Cadence-normalized frame counts: HD={len(hd_files)} DVD={len(dvd_files)} paired={n}")
 
           # Calibrated active-picture mask from the accepted still prototype.
           x0,y0,x1,y1=185,890,371,968

@@ -14,9 +14,10 @@ A later 4K upscale may be performed separately. This project should therefore av
    - The ideal output differs from the 1080p source only inside the network-bug footprint and only on frames where the bug is present.
    - Avoid whole-frame filtering, denoising, sharpening, resizing, color conversion, or other global image processing unless later evidence proves it necessary.
 
-2. **Do not replace the 1080p image with an upscaled DVD image.**
-   - The DVD is lower resolution and is used only to reconstruct content hidden by the bug.
-   - Native 1080p pixels remain authoritative everywhere they are visible.
+2. **Do not replace the 1080p image with an upscaled DVD image by default.**
+   - The DVD is lower resolution and is used primarily to reconstruct content hidden by the bug.
+   - Native 1080p pixels remain authoritative everywhere they are visible unless a controlled pre-production comparison demonstrates that a full-frame DVD upscale is genuinely equal or better for the intended viewing/restoration goal.
+   - AI or learned upscaling may be used selectively on the DVD donor region, including only the lower-left corner around the bug, if it materially improves mask estimation, registration, edge matching, or donor reconstruction without modifying unrelated 1080p pixels.
 
 3. **Minimize codec generation loss.**
    - Preserve original streams by bitstream copy whenever a stream does not need modification.
@@ -169,37 +170,94 @@ Inside the bug mask:
 
 Potentially use multiple neighboring DVD frames to improve donor reconstruction if temporal information helps recover detail, but only after establishing a strong single-frame baseline.
 
-### Phase 6: Prototype quality evaluation
+### Phase 6: Prototype quality evaluation and pre-production upscale gate
 
-Before restoring full episodes, generate representative short samples containing:
+**No full episode should be processed until this gate has been completed.**
+
+Use the same representative short time range for every candidate. The sample should include as many of the following as practical:
 
 - static detailed backgrounds;
-- faces crossing the bug;
+- faces, hair, skin, clothing, and other natural fine detail;
+- faces or textured objects crossing the network-bug region;
 - fast motion;
 - camera movement;
 - dark material;
 - bright/high-contrast material;
-- film/video noise;
-- credits or graphics near the bug.
+- film/video noise or grain;
+- text, credits, or graphics;
+- scenes where the bug region contains detail that makes donor softness easy to judge.
 
-Compare:
+Generate at least these controlled 1920×1080 candidates from the original sources:
 
-- original 1080p;
-- registered DVD donor;
-- restored composite;
-- difference image;
-- seam metrics around the mask;
-- temporal stability across consecutive frames.
+**A — native-1080p restoration baseline**
+- Start from the original 1080p source.
+- Repair only the validated bug footprint using the clean DVD donor and the current restoration workflow.
+- Preserve native 1080p picture content everywhere else.
+- This represents the preservation-first workflow.
+
+**B — full-frame pristine-DVD upscale**
+- Start from the original clean 480p/DVD source for the identical time range.
+- Normalize cadence and framing correctly.
+- Upscale the complete clean picture to 1920×1080 with the strongest practical free/open modern upscaling model under test.
+- Do not add unrelated grading, sharpening, denoising, or enhancement unless it is an inherent and documented part of the model/configuration.
+- This tests whether modern reconstruction from the pristine lower-resolution source is perceptually equal to or better than repairing the bugged 1080p source.
+
+**C — native 1080p plus upscaled DVD repair donor**
+- Start from the original 1080p source.
+- Upscale only the DVD pixels needed for the bug-region donor, preferably with a small registration/safety margin rather than the whole frame.
+- Composite that enhanced donor into the validated mask.
+- Preserve native 1080p pixels outside the repair region.
+- This is a likely high-value hybrid because learned reconstruction is confined to pixels for which the clean high-resolution source does not exist.
+
+**D — optional upscaled-corner reference for mask/registration**
+- If direct DVD↔1080p comparison is too soft or unstable to define the mask or registration confidently, upscale only the lower-left DVD corner containing and surrounding the clean reference area.
+- Use this enhanced corner as an analysis/reference image for bug-footprint estimation, registration, edge localization, and/or seam design.
+- It need not become part of the final composite. Its first role is to provide a sharper clean reference against the 1080p bugged corner.
+- Keep enough surrounding clean image outside the expected bug footprint to measure alignment and detect model-created edge artifacts.
+- Validate any mask inferred from the AI-upscaled reference against the original DVD and multiple scenes so hallucinated detail cannot silently redefine the bug boundary.
+
+For A, B, and C, use identical output geometry, cadence, clip boundaries, and final comparison encoding. Prefer lossless or near-lossless comparison intermediates so codec differences do not dominate the judgement.
+
+The comparison package should include:
+
+- complete synchronized candidate clips;
+- lossless PNG stills from identical frames;
+- enlarged crops of faces, hair, text, textures, edges, and the repaired/former-bug region;
+- side-by-side and split-screen video;
+- an alternating A/B/C presentation, preferably with a blind or semi-blind viewing pass before labels are revealed;
+- difference images where they are diagnostically useful;
+- objective metrics where meaningful, while treating visual temporal quality as authoritative when metrics disagree.
+
+Evaluate two spatial regimes separately:
+
+1. **Outside the bug footprint**
+   - A and C retain genuine 1080p source detail.
+   - B contains reconstructed detail from the DVD.
+   - Judge whether the full-frame upscale actually reproduces, loses, or invents detail relative to the native 1080p source.
+
+2. **Inside and immediately around the bug footprint**
+   - Compare native-filtered DVD repair against learned-upscale donor reconstruction.
+   - Inspect seam quality, texture continuity, edge fidelity, temporal stability, and whether the learned model creates plausible but false detail.
 
 Look specifically for:
 - softness inside the patch;
-- shimmer/flicker;
+- shimmer/flicker or other temporal instability;
+- hallucinated detail;
+- facial or text deformation;
 - mismatched grain/noise;
 - ringing;
 - edge halos;
 - color mismatch;
 - visible mask boundaries;
+- inconsistent sharpness across the mask;
 - temporal judder from incorrect DVD cadence mapping.
+
+**Decision rule before batch production:**
+- If A is clearly superior overall, continue with the preservation-first native-1080p workflow.
+- If B is genuinely equal or better over representative material, reconsider whether full-frame pristine-DVD upscaling is a simpler or better production path.
+- If C gives the best repair while retaining the native 1080p advantage elsewhere, adopt selective learned upscaling for the donor region only.
+- D may be adopted independently as an analysis aid even if its pixels are never used in final output.
+- Record the tested model, exact version, weights, parameters, preprocessing, hardware/backend, and hashes/configuration needed to reproduce the result.
 
 ### Phase 7: Final encoding strategy
 
@@ -261,7 +319,9 @@ A restoration method is not production-ready unless:
 - the output does not acquire unnecessary global filtering;
 - audio is unchanged unless a documented reason requires otherwise;
 - there is no additional intermediate lossy encode;
-- resulting files are suitable as inputs to later high-quality 4K upscaling.
+- resulting files are suitable as inputs to later high-quality 4K upscaling;
+- the Phase 6 A/B/C upscale gate has been completed before any full-episode production run;
+- any AI-upscaled donor or mask-reference region has been checked for hallucinated edges/detail and temporal instability rather than trusted solely because it appears sharper.
 
 ## Current episode 1 findings
 
@@ -280,7 +340,9 @@ Key current conclusions:
 1. Finish the episode 1 network-bug mask experiment.
 2. Produce several actual restored-frame prototypes.
 3. Compare hard-mask, feathered-mask, and local color/luma-matched compositing.
-4. Test temporal stability over short restored clips.
-5. Use the 720p source only as a secondary validation/reference source, since it also contains the network bug.
-6. Lock the minimum-quality final encode strategy only after the visual restoration method is proven.
-7. Generalize characterization and timeline mapping across all 22 episodes.
+4. Test temporal stability over the existing short sample.
+5. Build and run the Phase 6 controlled A/B/C upscale comparison on the same sample before processing any full episode.
+6. If mask estimation or donor matching benefits, add candidate D: AI-upscale only the lower-left clean DVD reference corner and test whether it improves registration/mask precision without introducing false boundaries.
+7. Use the 720p source only as a secondary validation/reference source, since it also contains the network bug.
+8. Lock the restoration path and minimum-quality final encode strategy only after the visual comparison is complete.
+9. Generalize characterization and timeline mapping across all 22 episodes.

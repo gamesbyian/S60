@@ -1,0 +1,325 @@
+name: Episode 1 three-minute restoration test
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/episode-01-three-minute-test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      FTP_HOST: wood.seedhost.eu
+      FTP_USER: ianseeds
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+
+    steps:
+      - name: Install tools
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install --quiet numpy opencv-python-headless
+
+      - name: Download episode 1 pair
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib, os
+          files={
+            "dvd.avi":"/downloads/S60/DVD/Studio 60 - 01 - Pilot.avi",
+            "hd.mp4":"/downloads/S60/1080p/Studio 60 S01E01.mp4",
+          }
+          ftp=ftplib.FTP()
+          ftp.connect(os.environ["FTP_HOST"],21,timeout=30)
+          ftp.login(os.environ["FTP_USER"],os.environ["FTP_PASSWORD"])
+          ftp.voidcmd("TYPE I")
+          for local,remote in files.items():
+              with open(local,"wb") as fh:
+                  ftp.retrbinary("RETR "+remote, fh.write, blocksize=1024*1024)
+          ftp.quit()
+          PY
+
+      - name: Extract calibration frame and three-minute plateau
+        shell: bash
+        run: |
+          # Calibration frame for the persistent logo silhouette.
+          ffmpeg -v error -ss 2200.0 -i hd.mp4 -frames:v 1 hd-cal.png
+          ffmpeg -v error -ss 2200.59 -i dvd.avi -frames:v 1 dvd-cal.png
+
+          # Three-minute window inside the +1.17 s timing plateau.
+          ffmpeg -v error -ss 1760.0 -i hd.mp4 -t 180 -an -c:v ffv1 hd-test.mkv
+          ffmpeg -v error -ss 1761.17 -i dvd.avi -t 181 -an \
+            -vf "decimate=cycle=5,setpts=N*1001/(24000*TB)" -r 24000/1001 -c:v ffv1 dvd-test.mkv
+
+      - name: Build shot plan and restore
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import cv2, json, math, os, subprocess, numpy as np
+
+          os.makedirs("frames/hd",exist_ok=True)
+          os.makedirs("frames/dvd",exist_ok=True)
+          os.makedirs("restored",exist_ok=True)
+
+          subprocess.run(["ffmpeg","-v","error","-i","hd-test.mkv","frames/hd/%06d.png"],check=True)
+          subprocess.run(["ffmpeg","-v","error","-i","dvd-test.mkv","frames/dvd/%06d.png"],check=True)
+
+          hs=sorted(os.listdir("frames/hd"))
+          ds=sorted(os.listdir("frames/dvd"))
+          n=min(len(hs),len(ds))
+
+          def active_hd(img): return img[4:1076,10:1914]
+          def active_dvd(img): return img[6:470,0:848]
+
+          def register(up,hd):
+              gd=cv2.cvtColor(up,cv2.COLOR_BGR2GRAY)
+              gh=cv2.cvtColor(hd,cv2.COLOR_BGR2GRAY)
+              pts=cv2.goodFeaturesToTrack(gd,maxCorners=1600,qualityLevel=0.01,minDistance=7,blockSize=5)
+              if pts is None: return None,None
+              nxt,status,err=cv2.calcOpticalFlowPyrLK(gd,gh,pts,None,winSize=(31,31),maxLevel=4)
+              good=status.reshape(-1)==1
+              src=pts.reshape(-1,2)[good]; dst=nxt.reshape(-1,2)[good]
+              keep=~((dst[:,0]>=170)&(dst[:,0]<384)&(dst[:,1]>=890)&(dst[:,1]<982))
+              src=src[keep]; dst=dst[keep]
+              M,inl=cv2.estimateAffinePartial2D(src,dst,method=cv2.RANSAC,ransacReprojThreshold=2.0,maxIters=4000,confidence=0.999,refineIters=30)
+              if M is None: return None,None
+              a,b,tx=M[0]; c,d,ty=M[1]
+              scale=(math.hypot(a,c)+math.hypot(b,d))/2
+              rot=math.degrees(math.atan2(c,a))
+              ni=int(inl.sum()) if inl is not None else 0
+              ok=bool(0.94<=scale<=1.06 and abs(rot)<=2 and abs(tx)<=80 and abs(ty)<=80 and ni>=50)
+              return M,{"ok":ok,"scale":float(scale),"rot":float(rot),"tx":float(tx),"ty":float(ty),"inliers":ni}
+
+          # Derive the accepted logo-shaped alpha once from the dark calibration frame.
+          hcal=active_hd(cv2.imread("hd-cal.png"))
+          dcal=active_dvd(cv2.imread("dvd-cal.png"))
+          upcal=cv2.resize(dcal,(hcal.shape[1],hcal.shape[0]),interpolation=cv2.INTER_LANCZOS4)
+          Mc,mc=register(upcal,hcal)
+          if Mc is None or not mc["ok"]:
+              raise RuntimeError("calibration registration failed")
+          donor_cal=cv2.warpAffine(upcal,Mc,(hcal.shape[1],hcal.shape[0]),flags=cv2.INTER_LANCZOS4)
+          dg=cv2.cvtColor(donor_cal,cv2.COLOR_BGR2GRAY).astype(np.int16)
+          hg=cv2.cvtColor(hcal,cv2.COLOR_BGR2GRAY).astype(np.int16)
+          roi=np.abs(hg-dg)[890:982,170:384].astype(np.uint8)
+          seed=(roi>=18).astype(np.uint8)*255
+          seed=cv2.morphologyEx(seed,cv2.MORPH_OPEN,np.ones((2,2),np.uint8))
+          seed=cv2.morphologyEx(seed,cv2.MORPH_CLOSE,np.ones((5,5),np.uint8))
+          cc,labels,stats,cent=cv2.connectedComponentsWithStats(seed,8)
+          kept=np.zeros_like(seed)
+          for i in range(1,cc):
+              if int(stats[i,cv2.CC_STAT_AREA])>=25:
+                  kept[labels==i]=255
+          kept=cv2.morphologyEx(kept,cv2.MORPH_CLOSE,np.ones((9,5),np.uint8))
+          kept=cv2.dilate(kept,np.ones((3,3),np.uint8),iterations=1)
+          full=np.zeros((1072,1904),dtype=np.uint8)
+          full[890:982,170:384]=kept
+          alpha=cv2.GaussianBlur(full,(0,0),sigmaX=1.1,sigmaY=1.1).astype(np.float32)/255.0
+          if not (2500 <= np.count_nonzero(alpha>0.01) <= 18000):
+              raise RuntimeError("logo alpha sanity gate failed")
+
+          # Preload low-res fingerprints for cut and donor-phase detection.
+          hd_low=[]; dvd_low=[]
+          for p in hs[:n]:
+              h=active_hd(cv2.imread("frames/hd/"+p))
+              hd_low.append(cv2.resize(cv2.cvtColor(h,cv2.COLOR_BGR2GRAY),(96,54),interpolation=cv2.INTER_AREA))
+          for p in ds:
+              d=active_dvd(cv2.imread("frames/dvd/"+p))
+              dvd_low.append(cv2.resize(cv2.cvtColor(d,cv2.COLOR_BGR2GRAY),(96,54),interpolation=cv2.INTER_AREA))
+
+          cuts=[0]
+          for i in range(1,n):
+              mad=float(np.mean(np.abs(hd_low[i].astype(np.float32)-hd_low[i-1].astype(np.float32))))
+              if mad>=22.0:
+                  cuts.append(i)
+          cuts=sorted(set(cuts+[n]))
+
+          shot_plan=[]
+          total_raw_anchors=0
+          unsupported=[]
+          for si in range(len(cuts)-1):
+              lo,hi=cuts[si],cuts[si+1]
+
+              # Find donor phase for this shot.
+              span=min(24,hi-lo)
+              probes=np.linspace(lo,lo+span-1,min(6,span),dtype=int).tolist() if span>0 else []
+              best_shift=0; best_score=float("inf")
+              for sh in range(-3,4):
+                  vals=[]
+                  for i in probes:
+                      j=i+sh
+                      if 0<=j<len(dvd_low):
+                          vals.append(float(np.mean(np.abs(hd_low[i].astype(np.float32)-dvd_low[j].astype(np.float32)))))
+                  if vals:
+                      score=float(np.median(vals))
+                      if score<best_score:
+                          best_score=score; best_shift=sh
+
+              # Register a sparse set of anchors across the shot.
+              anchor_idx=sorted(set(np.linspace(lo,hi-1,min(7,max(1,hi-lo)),dtype=int).tolist()))
+              good=[]
+              for i in anchor_idx:
+                  j=i+best_shift
+                  if not (0<=j<len(ds)): continue
+                  h=active_hd(cv2.imread("frames/hd/"+hs[i]))
+                  d=active_dvd(cv2.imread("frames/dvd/"+ds[j]))
+                  up=cv2.resize(d,(h.shape[1],h.shape[0]),interpolation=cv2.INTER_LANCZOS4)
+                  M,m=register(up,h)
+                  if M is not None and m["ok"]:
+                      good.append(m)
+
+              if not good:
+                  unsupported.append({"shot":si,"start":lo,"end":hi,"shift":best_shift,"probe_mad":best_score})
+                  shot_plan.append(None)
+                  continue
+
+              total_raw_anchors+=len(good)
+              vals={}
+              for k in ["scale","rot","tx","ty"]:
+                  arr=np.array([g[k] for g in good],dtype=np.float64)
+                  med=float(np.median(arr))
+                  mad=float(np.median(np.abs(arr-med)))+1e-9
+                  floor=0.002 if k=="scale" else 0.25 if k=="rot" else 4.0
+                  mask=np.abs(arr-med)<=max(floor,3.5*1.4826*mad)
+                  vals[k]=float(np.median(arr[mask])) if np.any(mask) else med
+
+              s,r,tx,ty=vals["scale"],math.radians(vals["rot"]),vals["tx"],vals["ty"]
+              M=np.array([[s*math.cos(r),-s*math.sin(r),tx],
+                          [s*math.sin(r), s*math.cos(r),ty]],dtype=np.float32)
+              shot_plan.append({"M":M,"shift":best_shift,"probe_mad":best_score,"anchors":len(good),
+                                "start":lo,"end":hi,"params":vals})
+
+          if unsupported:
+              raise RuntimeError("unsupported shots: "+json.dumps(unsupported[:20]))
+
+          # Restore every frame using its shot plan.
+          shot_for=np.empty(n,dtype=np.int32)
+          for si,p in enumerate(shot_plan):
+              shot_for[p["start"]:p["end"]]=si
+
+          temporal_delta=[]
+          local_offsets=[]
+          prev_roi=None
+          for i in range(n):
+              p=shot_plan[int(shot_for[i])]
+              j=i+p["shift"]
+              if not (0<=j<len(ds)):
+                  raise RuntimeError(f"donor index out of range at frame {i}: {j}")
+              hfull=cv2.imread("frames/hd/"+hs[i])
+              h=active_hd(hfull)
+              d=active_dvd(cv2.imread("frames/dvd/"+ds[j]))
+              up=cv2.resize(d,(h.shape[1],h.shape[0]),interpolation=cv2.INTER_LANCZOS4)
+              donor=cv2.warpAffine(up,p["M"],(h.shape[1],h.shape[0]),flags=cv2.INTER_LANCZOS4)
+
+              # Refine registration locally around the repair. Whole-frame affine
+              # metrics can be excellent while leaving a few-pixel residual in
+              # this corner, which turns the clean donor itself into a logo-shaped
+              # ghost after compositing. Search only translation ±6 px and score
+              # a surrounding ring that excludes the logo.
+              binmask=(alpha>0.01).astype(np.uint8)
+              outer=cv2.dilate(binmask,np.ones((35,35),np.uint8),iterations=1).astype(bool)
+              inner=cv2.dilate(binmask,np.ones((5,5),np.uint8),iterations=1).astype(bool)
+              ring=outer & (~inner)
+              ring_y,ring_x=np.where(ring)
+              local_dx=local_dy=0
+              best_local=float("inf")
+              hg=cv2.cvtColor(h,cv2.COLOR_BGR2GRAY).astype(np.float32)
+              dg0=cv2.cvtColor(donor,cv2.COLOR_BGR2GRAY).astype(np.float32)
+              for dy in range(-6,7):
+                  for dx in range(-6,7):
+                      yy=ring_y+dy; xx=ring_x+dx
+                      valid=(yy>=0)&(yy<dg0.shape[0])&(xx>=0)&(xx<dg0.shape[1])
+                      if np.count_nonzero(valid)<300:
+                          continue
+                      diff=np.abs(hg[ring_y[valid],ring_x[valid]]-dg0[yy[valid],xx[valid]])
+                      score=float(np.median(diff))
+                      if score<best_local:
+                          best_local=score; local_dx=dx; local_dy=dy
+              local_offsets.append([int(local_dx),int(local_dy),float(best_local)])
+              if local_dx or local_dy:
+                  T=np.array([[1,0,-local_dx],[0,1,-local_dy]],dtype=np.float32)
+                  donor=cv2.warpAffine(donor,T,(h.shape[1],h.shape[0]),flags=cv2.INTER_LANCZOS4,
+                                       borderMode=cv2.BORDER_REPLICATE)
+
+              # Robust local donor-to-HD tone fit after local residual alignment.
+              # Measure only in a narrow ring surrounding the logo, exclude the
+              # logo itself, clamp aggressively, and apply only beneath alpha.
+              outer=cv2.dilate(binmask,np.ones((17,17),np.uint8),iterations=1).astype(bool)
+              inner=cv2.dilate(binmask,np.ones((3,3),np.uint8),iterations=1).astype(bool)
+              ring=outer & (~inner)
+
+              donor_f=donor.astype(np.float32)
+              h_f=h.astype(np.float32)
+              corrected=donor_f.copy()
+              for ch in range(3):
+                  x=donor_f[:,:,ch][ring]
+                  y=h_f[:,:,ch][ring]
+                  if x.size>=200:
+                      # Trim strong outliers caused by residual misregistration,
+                      # highlights, and compression differences.
+                      diff=y-x
+                      lo,hi=np.percentile(diff,[10,90])
+                      keep=(diff>=lo)&(diff<=hi)
+                      x2=x[keep]; y2=y[keep]
+                      if x2.size>=100:
+                          xm=float(np.median(x2)); ym=float(np.median(y2))
+                          xs=float(np.median(np.abs(x2-xm)))+1e-6
+                          ys=float(np.median(np.abs(y2-ym)))+1e-6
+                          gain=float(np.clip(ys/xs,0.94,1.06))
+                          bias=float(np.clip(ym-gain*xm,-8.0,8.0))
+                          corrected[:,:,ch]=np.clip(donor_f[:,:,ch]*gain+bias,0,255)
+
+              a3=alpha[:,:,None]
+              restored=np.clip(h_f*(1-a3)+corrected*a3,0,255).astype(np.uint8)
+              hfull[4:1076,10:1914]=restored
+              cv2.imwrite(f"restored/{i+1:06d}.png",hfull)
+
+              rr=cv2.cvtColor(restored[884:988,164:390],cv2.COLOR_BGR2GRAY).astype(np.float32)
+              if prev_roi is not None:
+                  temporal_delta.append(float(np.mean(np.abs(rr-prev_roi))))
+              prev_roi=rr
+
+          report={
+              "frames":n,
+              "duration_seconds":n*1001/24000,
+              "shots":len(shot_plan),
+              "raw_anchor_registrations":total_raw_anchors,
+              "unsupported_shots":len(unsupported),
+              "shot_probe_mad_median":float(np.median([p["probe_mad"] for p in shot_plan])),
+              "shot_probe_mad_p95":float(np.percentile([p["probe_mad"] for p in shot_plan],95)),
+              "temporal_roi_delta_mean":float(np.mean(temporal_delta)),
+              "temporal_roi_delta_p95":float(np.percentile(temporal_delta,95)),
+              "local_offset_dx_median":float(np.median([v[0] for v in local_offsets])),
+              "local_offset_dy_median":float(np.median([v[1] for v in local_offsets])),
+              "local_offset_abs_p95":float(np.percentile([abs(v[0])+abs(v[1]) for v in local_offsets],95)),
+              "local_ring_mad_median":float(np.median([v[2] for v in local_offsets])),
+              "shot_plan":[{
+                  "start":p["start"],"end":p["end"],"shift":p["shift"],
+                  "probe_mad":p["probe_mad"],"anchors":p["anchors"],"params":p["params"]
+              } for p in shot_plan]
+          }
+          print("=== THREE MINUTE RESTORATION JSON ===")
+          print(json.dumps(report,indent=2))
+          PY
+
+      - name: Encode review clip with original HD audio
+        shell: bash
+        run: |
+          ffmpeg -v error -framerate 24000/1001 -i restored/%06d.png \
+            -ss 1760.0 -i hd.mp4 -t 180 \
+            -map 0:v:0 -map 1:a:0? \
+            -c:v libx264 -crf 12 -preset slow -pix_fmt yuv420p \
+            -c:a copy -shortest restored-three-minute.mp4
+
+      - name: Upload review artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: episode-01-three-minute-restoration
+          path: restored-three-minute.mp4
+          if-no-files-found: error
+          compression-level: 0

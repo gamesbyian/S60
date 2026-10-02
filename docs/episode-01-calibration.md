@@ -194,3 +194,21 @@ The preceding failed run paired 23.976 HD frames directly against the still-29.9
 A separate low-rate correspondence probe across the first timing discontinuity showed a stable +1 frame offset at 8 fps through index 59, followed by a sharp jump at index 60. With the HD boundary clip starting at 556.0 s, that places the correspondence break at roughly 563.5 s, consistent with the earlier refined 555–570 s transition interval.
 
 Current conclusion: the shaped repair is stable over ordinary motion when temporal cadence is normalized correctly. Production restoration should use explicit piecewise timing segments and cadence-normalized DVD donor frames; it should not rely on one continuous global offset.
+
+
+## Mixed-shot longform dry run
+
+A 60-second audit across three 20-second episode-1 segments now passes after replacing content-adaptive `mpdecimate` with deterministic `decimate=cycle=5`.
+
+This matters because the DVD source is a known 30000/1001 representation of 24000/1001 material with one repeated frame per five-frame cycle. Content-adaptive duplicate removal can discard additional low-motion frames and silently drift the donor timeline; deterministic inverse cadence preserves the intended temporal relationship.
+
+Final mixed-shot results:
+
+- Clip A: 479/479 recoverable frames, 471 raw valid registrations, 8 shot-level fallbacks.
+- Clip B: 479/479 recoverable frames, 445 raw valid registrations, 34 shot-level fallbacks.
+- Clip C: 480/480 recoverable frames, 476 raw valid registrations, 4 shot-level fallbacks.
+- All three clips reached 100% recoverable coverage.
+- Per-shot donor phase search stayed within ±3 cadence-normalized frames.
+- Clip B, previously the failure case, improved from roughly 38% raw registration to roughly 93% once deterministic cadence was used; donor probe MAD remained low instead of drifting into gross mismatch.
+
+Production requirements now include deterministic inverse cadence, explicit piecewise episode timing, per-shot donor-phase selection, strict raw registration gates, and robust shot-level transform fallback only within detected cuts.

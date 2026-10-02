@@ -1,0 +1,151 @@
+name: Episode 1 longform restoration dry run
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/episode-01-longform-dryrun.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  dryrun:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      FTP_HOST: wood.seedhost.eu
+      FTP_USER: ianseeds
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+
+    steps:
+      - name: Install tools
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install --quiet numpy opencv-python-headless
+
+      - name: Download episode 1 pair
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib, os
+          files={
+            "dvd.avi":"/downloads/S60/DVD/Studio 60 - 01 - Pilot.avi",
+            "hd.mp4":"/downloads/S60/1080p/Studio 60 S01E01.mp4",
+          }
+          ftp=ftplib.FTP()
+          ftp.connect(os.environ["FTP_HOST"],21,timeout=30)
+          ftp.login(os.environ["FTP_USER"],os.environ["FTP_PASSWORD"])
+          ftp.voidcmd("TYPE I")
+          for local,remote in files.items():
+              with open(local,"wb") as fh:
+                  ftp.retrbinary("RETR "+remote, fh.write, blocksize=1024*1024)
+          ftp.quit()
+          PY
+
+      - name: Extract mixed-shot validation clips
+        shell: bash
+        run: |
+          # Three 20 s stable-plateau clips selected from different timing segments.
+          ffmpeg -v error -ss 280.0  -i hd.mp4  -t 20 -an -c:v ffv1 hd-a.mkv
+          ffmpeg -v error -ss 281.93 -i dvd.avi -t 21 -an -vf "mpdecimate,setpts=N*1001/(24000*TB)" -r 24000/1001 -c:v ffv1 dvd-a.mkv
+
+          ffmpeg -v error -ss 1780.0 -i hd.mp4  -t 20 -an -c:v ffv1 hd-b.mkv
+          ffmpeg -v error -ss 1781.17 -i dvd.avi -t 21 -an -vf "mpdecimate,setpts=N*1001/(24000*TB)" -r 24000/1001 -c:v ffv1 dvd-b.mkv
+
+          ffmpeg -v error -ss 2180.0 -i hd.mp4  -t 20 -an -c:v ffv1 hd-c.mkv
+          ffmpeg -v error -ss 2180.59 -i dvd.avi -t 21 -an -vf "mpdecimate,setpts=N*1001/(24000*TB)" -r 24000/1001 -c:v ffv1 dvd-c.mkv
+
+      - name: Run dry-run registration audit
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import cv2, json, math, os, subprocess, numpy as np
+
+          clips=[("a","hd-a.mkv","dvd-a.mkv"),("b","hd-b.mkv","dvd-b.mkv"),("c","hd-c.mkv","dvd-c.mkv")]
+          roi=(170,890,384,982)
+
+          def extract(video,folder):
+              os.makedirs(folder,exist_ok=True)
+              subprocess.run(["ffmpeg","-v","error","-i",video,f"{folder}/%06d.png"],check=True)
+
+          def active_hd(img): return img[4:1076,10:1914]
+          def active_dvd(img): return img[6:470,0:848]
+
+          def register(up,hd):
+              gd=cv2.cvtColor(up,cv2.COLOR_BGR2GRAY)
+              gh=cv2.cvtColor(hd,cv2.COLOR_BGR2GRAY)
+              pts=cv2.goodFeaturesToTrack(gd,maxCorners=1600,qualityLevel=0.01,minDistance=7,blockSize=5)
+              if pts is None: return None,None
+              nxt,status,err=cv2.calcOpticalFlowPyrLK(gd,gh,pts,None,winSize=(31,31),maxLevel=4)
+              good=status.reshape(-1)==1
+              src=pts.reshape(-1,2)[good]; dst=nxt.reshape(-1,2)[good]
+              x0,y0,x1,y1=roi
+              keep=~((dst[:,0]>=x0)&(dst[:,0]<x1)&(dst[:,1]>=y0)&(dst[:,1]<y1))
+              src=src[keep]; dst=dst[keep]
+              M,inl=cv2.estimateAffinePartial2D(src,dst,method=cv2.RANSAC,ransacReprojThreshold=2.0,maxIters=4000,confidence=0.999,refineIters=30)
+              if M is None: return None,None
+              a,b,tx=M[0]; c,d,ty=M[1]
+              scale=(math.hypot(a,c)+math.hypot(b,d))/2
+              rot=math.degrees(math.atan2(c,a))
+              ni=int(inl.sum()) if inl is not None else 0
+              ok=(0.94<=scale<=1.06 and abs(rot)<=2 and abs(tx)<=80 and abs(ty)<=80 and ni>=50)
+              return M,{"ok":ok,"scale":scale,"rot":rot,"tx":float(tx),"ty":float(ty),"inliers":ni}
+
+          all_summaries=[]
+          for name,hv,dv in clips:
+              hf=f"frames/{name}/hd"; df=f"frames/{name}/dvd"
+              extract(hv,hf); extract(dv,df)
+              hs=sorted(os.listdir(hf)); ds=sorted(os.listdir(df))
+              n=min(len(hs),len(ds))
+              accepted=[]; rejected=[]
+
+              for i in range(n):
+                  hfull=cv2.imread(f"{hf}/{hs[i]}")
+                  dfull=cv2.imread(f"{df}/{ds[i]}")
+                  hd=active_hd(hfull)
+                  dvd=active_dvd(dfull)
+                  up=cv2.resize(dvd,(hd.shape[1],hd.shape[0]),interpolation=cv2.INTER_LANCZOS4)
+                  M,m=register(up,hd)
+                  if M is None or not m["ok"]:
+                      rejected.append({"frame":i,"registration":m})
+                  else:
+                      accepted.append({"frame":i,**m})
+
+              rates=len(accepted)/max(1,n)
+              vals={k:[x[k] for x in accepted] for k in ["scale","rot","tx","ty","inliers"]}
+              summary={
+                  "clip":name,
+                  "frames":n,
+                  "accepted":len(accepted),
+                  "rejected":len(rejected),
+                  "accept_rate":rates,
+                  "median":{
+                      k:(float(np.median(v)) if v else None) for k,v in vals.items()
+                  },
+                  "p95_abs_deviation":{
+                      k:(float(np.percentile(np.abs(np.array(v)-np.median(v)),95)) if v else None)
+                      for k,v in vals.items() if k!="inliers"
+                  },
+                  "sample_rejects":rejected[:10]
+              }
+              all_summaries.append(summary)
+
+          print("=== LONGFORM DRYRUN JSON ===")
+          print(json.dumps(all_summaries,indent=2))
+
+          if any(x["accept_rate"]<0.9 for x in all_summaries):
+              raise RuntimeError("one or more mixed-shot clips fell below 90% registration acceptance")
+          PY
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: episode-01-longform-dryrun
+          path: |
+            hd-a.mkv
+            hd-b.mkv
+            hd-c.mkv
+          if-no-files-found: error

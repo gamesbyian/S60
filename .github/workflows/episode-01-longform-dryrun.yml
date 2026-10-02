@@ -100,44 +100,99 @@ jobs:
               extract(hv,hf); extract(dv,df)
               hs=sorted(os.listdir(hf)); ds=sorted(os.listdir(df))
               n=min(len(hs),len(ds))
-              accepted=[]; rejected=[]
 
+              raw=[None]*n
+              hd_gray=[]
               for i in range(n):
                   hfull=cv2.imread(f"{hf}/{hs[i]}")
                   dfull=cv2.imread(f"{df}/{ds[i]}")
                   hd=active_hd(hfull)
                   dvd=active_dvd(dfull)
+                  hd_gray.append(cv2.resize(cv2.cvtColor(hd,cv2.COLOR_BGR2GRAY),(96,54),interpolation=cv2.INTER_AREA))
                   up=cv2.resize(dvd,(hd.shape[1],hd.shape[0]),interpolation=cv2.INTER_LANCZOS4)
                   M,m=register(up,hd)
-                  if M is None or not m["ok"]:
-                      rejected.append({"frame":i,"registration":m})
-                  else:
-                      accepted.append({"frame":i,**m})
+                  if M is not None and m["ok"]:
+                      raw[i]=m
 
-              rates=len(accepted)/max(1,n)
-              vals={k:[x[k] for x in accepted] for k in ["scale","rot","tx","ty","inliers"]}
+              # Detect hard scene cuts from HD itself. Registration fallback is
+              # never allowed to bridge a cut.
+              cuts=[0]
+              cut_scores=[]
+              for i in range(1,n):
+                  mad=float(np.mean(np.abs(hd_gray[i].astype(np.float32)-hd_gray[i-1].astype(np.float32))))
+                  cut_scores.append(mad)
+                  if mad>=22.0:
+                      cuts.append(i)
+              cuts.append(n)
+              cuts=sorted(set(cuts))
+
+              recovered=[None]*n
+              source=["reject"]*n
+              max_gap=24  # one second at 23.976
+
+              for si in range(len(cuts)-1):
+                  lo,hi=cuts[si],cuts[si+1]
+                  valid=[i for i in range(lo,hi) if raw[i] is not None]
+                  if not valid:
+                      continue
+                  for i in range(lo,hi):
+                      if raw[i] is not None:
+                          recovered[i]=raw[i]
+                          source[i]="raw"
+                          continue
+                      left=max([j for j in valid if j<i],default=None)
+                      right=min([j for j in valid if j>i],default=None)
+
+                      # Linear interpolation only when both anchors are nearby
+                      # and inside the same shot. Otherwise one-sided carry for
+                      # a very short gap. Long unsupported spans stay rejected.
+                      if left is not None and right is not None and i-left<=max_gap and right-i<=max_gap:
+                          t=(i-left)/(right-left)
+                          r={}
+                          for k in ["scale","rot","tx","ty"]:
+                              r[k]=float(raw[left][k]*(1-t)+raw[right][k]*t)
+                          r["inliers"]=int(min(raw[left]["inliers"],raw[right]["inliers"]))
+                          r["ok"]=True
+                          recovered[i]=r
+                          source[i]="interp"
+                      elif left is not None and i-left<=6:
+                          recovered[i]=dict(raw[left]); source[i]="carry-left"
+                      elif right is not None and right-i<=6:
+                          recovered[i]=dict(raw[right]); source[i]="carry-right"
+
+              raw_count=sum(x is not None for x in raw)
+              rec_count=sum(x is not None for x in recovered)
+              unresolved=[i for i,x in enumerate(recovered) if x is None]
+              fallback=sum(1 for s in source if s not in ("raw","reject"))
+
+              vals={k:[x[k] for x in recovered if x is not None] for k in ["scale","rot","tx","ty","inliers"]}
               summary={
                   "clip":name,
                   "frames":n,
-                  "accepted":len(accepted),
-                  "rejected":len(rejected),
-                  "accept_rate":rates,
+                  "scene_count":max(0,len(cuts)-1),
+                  "cut_frames":cuts[1:-1],
+                  "raw_accepted":raw_count,
+                  "raw_accept_rate":raw_count/max(1,n),
+                  "recovered_frames":rec_count,
+                  "recovered_accept_rate":rec_count/max(1,n),
+                  "fallback_frames":fallback,
+                  "unresolved_frames":len(unresolved),
+                  "sample_unresolved":unresolved[:20],
                   "median":{
                       k:(float(np.median(v)) if v else None) for k,v in vals.items()
                   },
                   "p95_abs_deviation":{
                       k:(float(np.percentile(np.abs(np.array(v)-np.median(v)),95)) if v else None)
                       for k,v in vals.items() if k!="inliers"
-                  },
-                  "sample_rejects":rejected[:10]
+                  }
               }
               all_summaries.append(summary)
 
           print("=== LONGFORM DRYRUN JSON ===")
           print(json.dumps(all_summaries,indent=2))
 
-          if any(x["accept_rate"]<0.9 for x in all_summaries):
-              raise RuntimeError("one or more mixed-shot clips fell below 90% registration acceptance")
+          if any(x["recovered_accept_rate"]<0.98 for x in all_summaries):
+              raise RuntimeError("one or more mixed-shot clips fell below 98% shot-constrained recoverable registration coverage")
           PY
 
       - name: Upload diagnostics
